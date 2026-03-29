@@ -191,7 +191,7 @@ pkg update && pkg upgrade
 pkg install python mpv yt-dlp socat
 termux-setup-storage
 pkg install termux-api   # optional
-git clone https://github.com/YOUR_USERNAME/musicloop.git
+git clone https://github.com/DrAsgharAbbas12/musicloop.git
 cd musicloop
 chmod +x musicloop.py
 python musicloop.py
