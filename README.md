@@ -31,7 +31,7 @@ You control it by typing, not tapping. You loop by count, time, or infinitely. Y
 pkg install python mpv yt-dlp socat && termux-setup-storage
 
 # 2 — Clone
-git clone https://github.com/YOUR_USERNAME/musicloop.git
+git clone https://github.com/DrAsgharAbbas12/musicloop.git
 cd musicloop
 
 # 3 — Run
@@ -40,7 +40,7 @@ python musicloop.py
 
 **Or one-liner:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/musicloop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DrAsgharAbbas12/musicloop/main/install.sh | bash
 ```
 
 ---
