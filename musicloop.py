@@ -33,7 +33,7 @@ import termios
 import select
 from datetime import datetime
 from pathlib import Path
-
+import tempfile
 # ─────────────────────────────────────────────
 #  PATHS & CONFIG
 # ─────────────────────────────────────────────
@@ -45,7 +45,8 @@ DAEMON_PID   = Path.home() / ".musicloop_daemon.pid"
 DAEMON_SOCK  = Path.home() / ".musicloop_daemon.sock"
 
 # Per-process socket — no multi-instance conflicts [Fix #6]
-IPC_SOCKET = f"/tmp/mpv_{os.getpid()}.sock"
+
+IPC_SOCKET = os.path.join(tempfile.gettempdir(), f"mpv_{os.getpid()}.sock")
 
 DEFAULT_DOWNLOAD_DIR = "/data/data/com.termux/files/home/storage/downloads"
 
@@ -498,6 +499,13 @@ CONTROLS_HELP = (
     "[v N+Enter]=set vol  [q]=quit  [?]=help"
 )
 
+DEBUG = True
+
+def dprint(msg):
+    if DEBUG:
+        print(msg)
+
+
 def control_loop_raw(mpv: MPVController):
     """
     Raw tty single-keypress control.
@@ -525,16 +533,20 @@ def control_loop_raw(mpv: MPVController):
                     try:
                         vol = int(buf[1:].strip())
                         mpv.set_volume(vol)
-                        print(f"\r{C.GREEN}✔  Volume → {vol}   {C.RESET}")
+                        if DEBUG:
+                            print(f"\r{C.GREEN}✔  Volume → {vol}   {C.RESET}")
                     except ValueError:
-                        print(f"\r{C.RED}✘  Invalid volume   {C.RESET}")
+                        if DEBUG:
+                            print(f"\r{C.RED}✘  Invalid volume   {C.RESET}")
                     buf = ""
                 elif ch.isdigit() or ch == " ":
                     buf += ch
-                    print(f"\r{C.CYAN}vol: {buf[1:]}  {C.RESET}", end="", flush=True)
+                    if DEBUG:
+                        print(f"\r{C.CYAN}vol: {buf[1:]}  {C.RESET}", end="", flush=True)
                 elif ch == "\x7f":
                     buf = buf[:-1]
-                    print(f"\r{C.CYAN}vol: {buf[1:]}   {C.RESET}", end="", flush=True)
+                    if DEBUG:
+                        print(f"\r{C.CYAN}vol: {buf[1:]}   {C.RESET}", end="", flush=True)
                 else:
                     buf = ""
                 continue
@@ -543,26 +555,32 @@ def control_loop_raw(mpv: MPVController):
                 paused = not paused
                 if paused:
                     mpv.pause()
-                    print(f"\r{C.YELLOW}⏸  Paused          {C.RESET}")
+                    if DEBUG:
+                        print(f"\r{C.YELLOW}⏸  Paused          {C.RESET}")
                 else:
                     mpv.resume()
-                    print(f"\r{C.GREEN}▶  Playing         {C.RESET}")
+                    if DEBUG:
+                        print(f"\r{C.GREEN}▶  Playing         {C.RESET}")
 
             elif ch in ("+", "="):
                 mpv.volume_up()
-                print(f"\r{C.GREEN}🔊 Volume +5       {C.RESET}")
+                if DEBUG:
+                    print(f"\r{C.GREEN}🔊 Volume +5       {C.RESET}")
 
             elif ch in ("-", "_"):
                 mpv.volume_down()
-                print(f"\r{C.GREEN}🔉 Volume -5       {C.RESET}")
+                if DEBUG:
+                    print(f"\r{C.GREEN}🔉 Volume -5       {C.RESET}")
 
             elif ch == "v":
                 buf = "v"
-                print(f"\r{C.CYAN}vol: {C.RESET}", end="", flush=True)
+                if DEBUG:
+                    print(f"\r{C.CYAN}vol: {C.RESET}", end="", flush=True)
 
             elif ch in ("q", "Q", "\x03"):
                 mpv.quit()
-                print(f"\r{C.RED}⏹  Stopped         {C.RESET}")
+                if DEBUG:
+                    print(f"\r{C.RED}⏹  Stopped         {C.RESET}")
                 break
 
             elif ch == "?":
@@ -594,7 +612,7 @@ def control_loop_line(mpv: MPVController):
 
 
 # ─────────────────────────────────────────────
-#  PLAYBACK CORE
+#  PLAYBACK CORE (SAFE FIXED VERSION)
 # ─────────────────────────────────────────────
 
 def now_playing_display(title, mode_str):
@@ -609,8 +627,17 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
     title = title or Path(str(file_path)).stem
 
     mpv_cmd = [
-        "mpv", "--no-video", "--quiet",
-        f"--input-ipc-server={IPC_SOCKET}",  # per-process [Fix #6]
+        "mpv",
+        "--no-video",
+
+        # FIX #1: clean output (prevents ugly terminal spam)
+        "--no-terminal",
+        "--quiet",
+        "--msg-level=all=no",
+
+        # IPC (unchanged logic, safer path usage)
+        f"--input-ipc-server={IPC_SOCKET}",
+
         f"--volume={cfg.get('volume', 100)}",
     ]
 
@@ -635,13 +662,18 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
     send_notification("▶ Now Playing", title)
 
     try:
-        if os.path.exists(IPC_SOCKET):
+        # FIX #2: safer socket removal (avoid race crash)
+        try:
             os.remove(IPC_SOCKET)
+        except FileNotFoundError:
+            pass
 
         proc = subprocess.Popen(mpv_cmd)
 
-        # Wait for IPC socket (max 2s)
-        for _ in range(20):
+        # FIX #3: safer IPC wait (also detects mpv crash)
+        for _ in range(50):  # up to ~5 seconds
+            if proc.poll() is not None:
+                break
             if os.path.exists(IPC_SOCKET):
                 break
             time.sleep(0.1)
@@ -680,8 +712,13 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
     finally:
         if cfg.get("wake_lock"):
             release_wake_lock()
-        if os.path.exists(IPC_SOCKET):
-            os.remove(IPC_SOCKET)
+
+        # FIX #4: safe cleanup
+        try:
+            if os.path.exists(IPC_SOCKET):
+                os.remove(IPC_SOCKET)
+        except Exception:
+            pass
 
 
 def play_queue(cfg):
