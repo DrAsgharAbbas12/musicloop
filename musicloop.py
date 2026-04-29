@@ -20,10 +20,12 @@ Fixes in v2.1:
   [8] Background daemon mode (play + detach)
 """
 
+import random
 import subprocess
 import time
 import os
 import sys
+import glob
 import json
 import argparse
 import threading
@@ -40,7 +42,7 @@ import tempfile
 
 CONFIG_PATH  = Path.home() / ".musicloop.json"
 HISTORY_PATH = Path.home() / ".musicloop_history.json"
-QUEUE_PATH   = Path.home() / ".musicloop_queue.json"
+DB_PATH   = Path.home() / ".musicloop_queue.json"
 DAEMON_PID   = Path.home() / ".musicloop_daemon.pid"
 DAEMON_SOCK  = Path.home() / ".musicloop_daemon.sock"
 
@@ -97,7 +99,8 @@ def banner():
 ║         Termux Edition · Hardened        ║
 ║          Streaming · Daemon Mode         ║
 ║                                          ║
-║           By Dr. Asghar Askari           ║
+║              Programmed By:              ║
+║          Dr. Asghar Abbas Askari         ║
 ╚══════════════════════════════════════════╝{C.RESET}
 """)
 
@@ -198,7 +201,10 @@ def load_history():
     return []
 
 def save_to_history(title, path, source):
-    history = load_history()
+    history = []
+    if HISTORY_PATH.exists():
+        with open(HISTORY_PATH) as f:
+            history = json.load(f)
     history.insert(0, {
         "title": title,
         "path": str(path),
@@ -208,6 +214,15 @@ def save_to_history(title, path, source):
     history = history[:50]
     with open(HISTORY_PATH, "w") as f:
         json.dump(history, f, indent=2)
+    db = load_db()
+    db["history"].insert(0, {
+        "title": title,
+        "path": str(path),
+        "source": source,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+    })
+    db["history"] = db["history"][:50]
+    save_db(db)
 
 def show_history():
     history = load_history()
@@ -238,58 +253,190 @@ def show_history():
 #  QUEUE  [Fix #4: remove by index, move up/down]
 # ─────────────────────────────────────────────
 
-def load_queue():
-    if QUEUE_PATH.exists():
-        with open(QUEUE_PATH) as f:
-            return json.load(f)
-    return []
+def load_db():
+    default_db = {
+        "queues": {"default": []},
+        "state": {
+            "current_queue": "default",
+            "index": 0,
+            "mode": "normal",
+            "playing": False
+        },
+        "history": []
+    }
 
-def save_queue(q):
-    with open(QUEUE_PATH, "w") as f:
-        json.dump(q, f, indent=2)
+    if not DB_PATH.exists():
+        return default_db
 
-def add_to_queue(path, title="Unknown"):
-    q = load_queue()
+    try:
+        with open(DB_PATH, "r") as f:
+            db = json.load(f)
+
+        # ---------------------------
+        # FIX: OLD FORMAT HANDLING
+        # ---------------------------
+
+        if isinstance(db, list):
+            warn("Old queue format detected. Migrating...")
+            db = {
+                "queues": {"default": db},
+                "state": {
+                    "current_queue": "default",
+                    "index": 0,
+                    "mode": "normal",
+                    "playing": False
+                },
+                "history": []
+            }
+            save_db(db)
+            return db
+
+        if not isinstance(db, dict):
+            warn("Invalid DB format. Resetting.")
+            return default_db
+
+        # ensure structure exists
+        db.setdefault("queues", {"default": []})
+        db.setdefault("state", {})
+        db.setdefault("history", [])
+
+        db["state"].setdefault("current_queue", "default")
+        db["state"].setdefault("index", 0)
+        db["state"].setdefault("mode", "normal")
+        db["state"].setdefault("playing", False)
+
+        return db
+
+    except json.JSONDecodeError:
+        warn("Corrupted DB file. Resetting.")
+        return default_db
+
+
+
+def save_db(db):
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(dir=str(DB_PATH.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(db, f, indent=2)
+        os.replace(tmp, DB_PATH)
+    except Exception as e:
+        err(f"DB save failed: {e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+def _q(db, name):
+    if "queues" not in db:
+        db["queues"] = {}
+    db["queues"].setdefault(name, [])
+    return db["queues"][name]
+
+
+def current(db):
+    return db["state"]["current_queue"]
+
+
+def set_queue(db, name):
+    db["queues"].setdefault(name, [])
+    db["state"]["current_queue"] = name
+
+
+def state(db):
+    return db["state"]
+
+def add_to_queue(path, title="Unknown", queue_name=None):
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
+    if not Path(path).exists():
+        err("File not found")
+        return
+
+    if any(x["path"] == str(path) for x in q):
+        warn("Already in queue")
+        return
+
     q.append({"path": str(path), "title": title})
-    save_queue(q)
-    ok(f"Added to queue: {title}")
+    save_db(db)
+    ok(f"Added → [{qname}] {title}")
 
-def remove_from_queue(index):
-    """Remove item by 1-based index."""
-    q = load_queue()
+def remove_from_queue(index, queue_name=None):
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
     if 1 <= index <= len(q):
         removed = q.pop(index - 1)
-        save_queue(q)
+        save_db(db)
         ok(f"Removed: {removed['title']}")
-    else:
-        err(f"Invalid index: {index}")
+        return removed
 
-def move_queue_item(index, direction):
-    """Move item up (-1) or down (+1) in queue."""
-    q = load_queue()
-    idx = index - 1
-    new_idx = idx + direction
-    if 0 <= idx < len(q) and 0 <= new_idx < len(q):
-        q[idx], q[new_idx] = q[new_idx], q[idx]
-        save_queue(q)
-        ok(f"Moved item {'up' if direction == -1 else 'down'}")
-    else:
-        err("Cannot move item further.")
+    err("Invalid index")
 
-def show_queue():
-    q = load_queue()
+def move_queue_item(index, direction, queue_name=None):
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
+    i = index - 1
+    j = i + direction
+
+    if 0 <= i < len(q) and 0 <= j < len(q):
+        q[i], q[j] = q[j], q[i]
+        save_db(db)
+        ok("Moved item")
+        return True
+
+    err("Cannot move")
+    return False
+
+def show_queue(queue_name=None):
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
     if not q:
-        info("Queue is empty.")
+        info(f"[{qname}] empty")
         return
-    head(f"Queue ({len(q)} songs)")
-    for i, item in enumerate(q, 1):
-        exists = "✔" if os.path.exists(item["path"]) else "✘"
-        color = C.GREEN if exists == "✔" else C.RED
-        print(f"  {C.DIM}{i:2}.{C.RESET} {color}{exists}{C.RESET} {item['title'][:60]}")
 
-def clear_queue():
-    save_queue([])
-    ok("Queue cleared.")
+    head(f"Queue: {qname} ({len(q)})")
+
+    for i, item in enumerate(q, 1):
+        exists = Path(item["path"]).exists()
+        symbol = "✔" if exists else "✘"
+        color = C.GREEN if exists else C.RED
+
+        print(f"{i:2}. {color}{symbol}{C.RESET} {item['title']}")
+
+def set_mode(mode):
+    db = load_db()
+    if mode not in ["normal", "shuffle", "repeat_all"]:
+        err("Invalid mode")
+        return
+
+    db["state"]["mode"] = mode
+    save_db(db)
+    ok(f"Mode → {mode}")
+
+
+def next_index(db, q):
+    st = db["state"]
+    mode = st["mode"]
+    i = st["index"]
+
+    if not q:
+        return 0
+
+    if mode == "shuffle":
+        return random.randint(0, len(q) - 1)
+
+    if mode == "repeat_all":
+        return (i + 1) % len(q)
+
+    return min(i + 1, len(q) - 1)
+
 
 
 # ─────────────────────────────────────────────
@@ -721,24 +868,89 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
             pass
 
 
-def play_queue(cfg):
-    q = load_queue()
+def play_queue(cfg, queue_name=None, auto_clear=False):
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
     if not q:
-        warn("Queue is empty.")
+        warn("Queue empty")
         return
 
-    head(f"Playing Queue ({len(q)} songs)")
-    for i, item in enumerate(q, 1):
-        path, title = item["path"], item["title"]
-        if not os.path.exists(path):
-            warn(f"Skipping (missing): {title}")
+    st = db["state"]
+    st["playing"] = True
+
+    head(f"Playing [{qname}] mode={st['mode']}")
+
+    i = st["index"]
+
+    while i < len(q):
+        item = q[i]
+        path = item["path"]
+        title = item["title"]
+
+        if not Path(path).exists():
+            warn(f"Missing: {title}")
+            i += 1
             continue
-        info(f"[{i}/{len(q)}] {title}")
+
+        info(f"[{i+1}/{len(q)}] {title}")
+
+        st["index"] = i
+        save_db(db)
+
         play_file(path, "once", None, cfg, title)
 
-    ok("Queue finished.")
-    clear_queue()
+        db["history"].append(item)
 
+        i = next_index(db, q)
+
+        if db["state"]["mode"] == "normal":
+            i += 1
+
+    st["playing"] = False
+    st["index"] = 0
+
+    ok("Playback finished")
+
+    if auto_clear:
+        db["queues"][qname] = []
+        save_db(db)
+
+def stop():
+    db = load_db()
+    db["state"]["playing"] = False
+    db["state"]["index"] = 0
+    save_db(db)
+    ok("Stopped")
+
+
+def skip():
+    db = load_db()
+    db["state"]["index"] += 1
+    save_db(db)
+    ok("Skipped")
+
+
+def pause():
+    db = load_db()
+    db["state"]["playing"] = False
+    save_db(db)
+    ok("Paused")
+
+def set_queue(db, name):
+    db["queues"].setdefault(name, [])
+    db["state"]["current_queue"] = name
+
+def clear_queue(queue_name=None):
+    db = load_db()
+    qname = queue_name or current(db)
+    if qname not in db["queues"]:
+        err(f"Queue '{qname}' does not exist")
+        return
+    db["queues"][qname] = []
+    save_db(db)
+    ok(f"Queue '{qname}' cleared")
 
 # ─────────────────────────────────────────────
 #  DAEMON MODE  [Feature #8]
@@ -851,8 +1063,9 @@ def get_float(prompt):
 def get_file_path(prompt):
     while True:
         p = input(f"{C.WHITE}{prompt}: {C.RESET}").strip()
+        path_of_file = f'/data/data/com.termux/files/home/storage/downloads/songs/{p}'
         p = os.path.expanduser(p)
-        if os.path.exists(p): return p
+        if os.path.exists(path_of_file): return path_of_file
         err("File not found.")
 
 def get_loop_mode():
@@ -1021,31 +1234,104 @@ def handle_args(args, cfg):
 # ─────────────────────────────────────────────
 #  INTERACTIVE MENUS
 # ─────────────────────────────────────────────
-
 def queue_menu(cfg):
-    head("Queue")
-    action = choose("Queue action", [
-        ("1", "Show queue"),
-        ("2", "Play queue"),
-        ("3", "Add file to queue"),
-        ("4", "Remove item by index"),
-        ("5", "Move item up"),
-        ("6", "Move item down"),
-        ("7", "Clear queue"),
-        ("8", "Back"),
-    ])
-    if action == "1": show_queue()
-    elif action == "2": play_queue(cfg)
+    head("Queue System")
+
+    db = load_db()
+    current_q = db["state"]["current_queue"]
+
+    action = choose(
+        f"Queue action (current: {current_q})",
+        [
+            ("1", "Show queue"),
+            ("2", "Play queue"),
+            ("3", "Add file to queue"),
+            ("4", "Remove item by index"),
+            ("5", "Move item up"),
+            ("6", "Move item down"),
+            ("7", "Clear current queue"),
+            ("8", "Switch queue"),
+            ("9", "List all queues"),
+            ("0", "Back"),
+        ]
+    )
+
+    # -------------------
+    # BASIC OPERATIONS
+    # -------------------
+
+    if action == "1":
+        show_queue()
+
+    elif action == "2":
+        play_queue(cfg)
+
     elif action == "3":
         p = get_file_path("File path")
         add_to_queue(p, Path(p).stem)
+
     elif action == "4":
-        show_queue(); remove_from_queue(get_int("Remove item #"))
+        show_queue()
+        remove_from_queue(get_int("Remove item #"))
+
     elif action == "5":
-        show_queue(); move_queue_item(get_int("Move item # up"), -1)
+        show_queue()
+        move_queue_item(get_int("Move item # up"), -1)
+
     elif action == "6":
-        show_queue(); move_queue_item(get_int("Move item # down"), 1)
-    elif action == "7": clear_queue()
+        show_queue()
+        move_queue_item(get_int("Move item # down"), 1)
+
+    elif action == "7":
+        clear_queue()
+
+    # -------------------
+    # MULTI-QUEUE FEATURES
+    # -------------------
+
+    elif action == "8":
+        db = load_db()
+        queues = list(db.get("queues", {}).keys())
+
+        if not queues:
+            warn("No queues exist")
+            return
+
+    # build indexed menu (stable input system)
+        options = [(str(i), q) for i, q in enumerate(queues)]
+
+        selected_index = choose(
+            "Select queue",
+            options
+         )
+
+        queue_name = queues[int(selected_index)]
+
+        if selected_index is None or selected_index == "":
+            warn("No selection made")
+            return
+
+        idx = int(selected_index)
+        if idx < 0 or idx >= len(queues):
+            warn("Out of range")
+            return
+
+        set_queue(db, queue_name)
+        save_db(db)
+
+        ok(f"Switched to queue: {queue_name}")
+
+
+    elif action == "9":
+        db = load_db()
+        queues = db.get("queues", {})
+
+        head("All Queues")
+        for name, items in queues.items():
+            print(f" - {name} ({len(items)})")
+
+    elif action == "0":
+        return
 
 
 def interactive_menu(cfg):
@@ -1088,9 +1374,48 @@ def interactive_menu(cfg):
             play_file(file_path, lm, lv, cfg, title)
 
         elif action == "4":
-            fp = get_file_path("File path")
+            MUSIC_DIR = Path("/data/data/com.termux/files/home/storage/downloads/songs")
+            MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+            audio_extensions = ("*.mp3", "*.m4a", "*.opus", "*.flac", "*.wav", "*.ogg")
+            music_files = []
+            for ext in audio_extensions:
+                music_files.extend(MUSIC_DIR.glob(ext))
+
+                music_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            if not music_files:
+                warn("No music files found in songs directory")
+                print(f"{C.DIM}Download some songs first using search option{C.RESET}")
+                continue
+            print(f"\n{C.BOLD}{C.CYAN}——— Available Files ({len(music_files)}) ———{C.RESET}\n")
+            display_limit = 30
+            for idx, file in enumerate(music_files[:display_limit], 1):
+                size_mb = file.stat().st_size / (1024 * 1024)
+                name = file.stem[:55] + "..." if len(file.stem) > 55 else file.stem
+                print(f"  {C.CYAN}{idx:3}.{C.RESET} {name:<58} {C.DIM}({size_mb:.1f} MB){C.RESET}")
+            if len(music_files) > display_limit:
+                print(f"\n  {C.DIM}... and {len(music_files) - display_limit} more files{C.RESET}")
+
+            while True:
+                try:
+                    choice = input(f"\n{C.WHITE}Enter number (or 0 to cancel): {C.RESET}").strip()
+                    if choice == "0":
+                        continue
+                    if choice.isdigit():
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(music_files):
+                            fp = str(music_files[idx])
+                            title = music_files[idx].stem
+                            ok(f"Selected: {title}")
+                            break
+                        else:
+                            err(f"Invalid number. Choose 1-{len(music_files)}")
+                    else:
+                        err("Please enter a valid number")
+                except (ValueError, IndexError):
+                    err("Invalid selection")
+                    continue
             lm, lv = get_loop_params(get_loop_mode())
-            play_file(fp, lm, lv, cfg, Path(fp).stem)
+            play_file(fp, lm, lv, cfg, title)
 
         elif action == "5":
             path = show_history()
