@@ -79,6 +79,268 @@ def save_config(cfg):
 def clear_screen():
     os.system("cls" if os.name == 'nt' else "clear")
 
+
+# ─────────────────────────────────────────────
+#  TASTE TRACKING & RECOMMENDATIONS (v2.3)
+# ─────────────────────────────────────────────
+
+TASTE_PATH = Path.home() / ".musicloop_taste.json"
+
+DEFAULT_TASTE = {
+    "user_id": "default",
+    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "total_plays": 0,
+    "unique_songs": {},
+    "artist_stats": {},
+    "keyword_stats": {},
+    "listening_patterns": {
+        "morning": 0,    # 5am-12pm
+        "afternoon": 0,  # 12pm-5pm
+        "evening": 0,    # 5pm-9pm
+        "night": 0       # 9pm-5am
+    },
+    "recommendation_settings": {
+        "algorithm": "artist_based",  # keyword_based, artist_based, hybrid
+        "auto_recommend": True,
+        "daily_suggestions": 5
+    },
+    "blacklist": {
+        "artists": [],
+        "songs": [],
+        "keywords": []
+    },
+    "preferences": {
+        "preferred_mood": None,  # calm, energetic, sad, happy
+        "preferred_language": None,
+        "min_duration": 60,
+        "max_duration": 600
+    }
+}
+
+def load_taste_profile():
+    if TASTE_PATH.exists():
+        with open(TASTE_PATH, 'r') as f:
+            taste = json.load(f)
+            # Merge with defaults for new fields
+            for key, value in DEFAULT_TASTE.items():
+                if key not in taste:
+                    taste[key] = value
+            return taste
+    return DEFAULT_TASTE.copy()
+
+def save_taste_profile(taste):
+    taste["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    TASTE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TASTE_PATH, 'w') as f:
+        json.dump(taste, f, indent=2)
+
+def extract_taste_features(song_title, artist=None, duration=None):
+    """Extract keywords, language, mood from song title"""
+    features = {
+        "keywords": [],
+        "language": "unknown",
+        "mood": "neutral",
+        "era": "unknown"
+    }
+    # Keyword extraction (common music terms)
+    common_keywords = ["remix", "cover", "live", "official", "video", 
+                       "audio", "slowed", "reverb", "sped up", "edit",
+                       "qawwali", "sufi", "classical", "pop", "rock"]
+    title_lower = song_title.lower()
+    for keyword in common_keywords:
+        if keyword in title_lower:
+            features["keywords"].append(keyword)
+    # Language detection (basic)
+    urdu_indicators = ["ali", "mola", "haq", "sher", "mardan", "qawwali", "sufi"]
+    hindi_indicators = ["jaan", "dil", "pyar", "ishq", "mohabbat"]
+    punjabi_indicators = ["tera", "mera", "sadda", "challa"]
+    for word in urdu_indicators:
+        if word in title_lower:
+            features["language"] = "urdu"
+            break
+    if features["language"] == "unknown":
+        for word in hindi_indicators:
+            if word in title_lower:
+                features["language"] = "hindi"
+                break
+    if features["language"] == "unknown":
+        for word in punjabi_indicators:
+            if word in title_lower:
+                features["language"] = "punjabi"
+                break
+    # Mood detection
+    calm_words = ["slow", "calm", "peaceful", "spiritual", "sufi", "qawwali"]
+    energetic_words = ["fast", "energetic", "dance", "party", "remix", "bass"]
+    sad_words = ["sad", "heartbreak", "lonely", "tears", "mourn"]
+    happy_words = ["happy", "joy", "celebrate", "fun", "smile"]
+    for word in calm_words:
+        if word in title_lower:
+            features["mood"] = "calm"
+            break
+    for word in energetic_words:
+        if word in title_lower:
+            features["mood"] = "energetic"
+            break
+    for word in sad_words:
+        if word in title_lower:
+            features["mood"] = "sad"
+            break
+    for word in happy_words:
+        if word in title_lower:
+            features["mood"] = "happy"
+            break
+    return features
+
+def update_taste_profile(song_title, path, played_duration=None, total_duration=None):
+    """Update user's taste profile based on played song"""
+    taste = load_taste_profile()
+    # Get or create song entry
+    song_key = str(path)
+    if song_key not in taste["unique_songs"]:
+        # New song - extract features
+        features = extract_taste_features(song_title)
+        taste["unique_songs"][song_key] = {
+            "title": song_title,
+            "play_count": 0,
+            "last_played": None,
+            "total_listened_sec": 0,
+            "features": features
+        }
+    song_data = taste["unique_songs"][song_key]
+    song_data["play_count"] += 1
+    song_data["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if played_duration and total_duration:
+        completion = played_duration / total_duration if total_duration > 0 else 0
+        song_data["total_listened_sec"] += played_duration
+        song_data["completion_rate"] = completion
+    # use first three words for artist proxy for now
+    artist = " ".join(song_title.split()[:2])
+    if artist not in taste["artist_stats"]:
+        taste["artist_stats"][artist] = {"plays": 0, "last_played": None}
+    taste["artist_stats"][artist]["plays"] += 1
+    taste["artist_stats"][artist]["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Update keyword stats
+    for keyword in song_data["features"]["keywords"]:
+        if keyword not in taste["keyword_stats"]:
+            taste["keyword_stats"][keyword] = 0
+        taste["keyword_stats"][keyword] += 1
+    # Update listening pattern based on current hour
+    current_hour = datetime.now().hour
+    if 5 <= current_hour < 12:
+        taste["listening_patterns"]["morning"] += 1
+    elif 12 <= current_hour < 17:
+        taste["listening_patterns"]["afternoon"] += 1
+    elif 17 <= current_hour < 21:
+        taste["listening_patterns"]["evening"] += 1
+    else:
+        taste["listening_patterns"]["night"] += 1
+    taste["total_plays"] += 1
+    save_taste_profile(taste)
+
+def get_daily_recommendations(limit=5):
+    """Generate personalized recommendations based on taste profile"""
+    taste = load_taste_profile()
+    settings = taste["recommendation_settings"]
+    recommendations = []
+    if settings["algorithm"] == "keyword_based":
+        # Get top keywords
+        top_keywords = sorted(taste["keyword_stats"].items(), 
+                             key=lambda x: x[1], reverse=True)[:3]
+        if top_keywords:
+            query = " ".join([kw[0] for kw in top_keywords])
+            results = search_results(query, limit=limit)
+            recommendations = [(title, url, f"Based on your interest in '{top_keywords[0][0]}'") 
+                              for title, url in results[:limit]]
+    elif settings["algorithm"] == "artist_based":
+        # Get top artist
+        top_artists = sorted(taste["artist_stats"].items(), 
+                            key=lambda x: x[1]["plays"], reverse=True)
+        if top_artists:
+            artist = top_artists[0][0]
+            query = f"{artist} songs"
+            results = search_results(query, limit=limit)
+            recommendations = [(title, url, f"Because you like {artist}") 
+                              for title, url in results[:limit]]
+    elif settings["algorithm"] == "hybrid":
+        # Combine keyword and artist results
+        kw_results = []
+        artist_results = []
+        top_keywords = sorted(taste["keyword_stats"].items(), 
+                             key=lambda x: x[1], reverse=True)[:2]
+        if top_keywords:
+            query = " ".join([kw[0] for kw in top_keywords])
+            kw_results = search_results(query, limit=3)
+        top_artists = sorted(taste["artist_stats"].items(), 
+                            key=lambda x: x[1]["plays"], reverse=True)
+        if top_artists:
+            artist = top_artists[0][0]
+            artist_results = search_results(f"{artist} songs", limit=3)
+        # Merge and deduplicate
+        seen = set()
+        for title, url in kw_results + artist_results:
+            if title not in seen and len(recommendations) < limit:
+                seen.add(title)
+                recommendations.append((title, url, "Hybrid recommendation"))
+    # Filter out blacklisted items
+    recommendations = [r for r in recommendations
+                      if not any(black in r[0].lower() for black in taste["blacklist"]["keywords"])]
+    return recommendations
+
+def show_daily_suggestions(cfg):
+    """Display today's recommendations and allow playing/adding to queue"""
+    head("🎵 Today's Recommendations")
+    info("Based on your listening taste profile")
+    recommendations = get_daily_recommendations(limit=7)
+    if not recommendations:
+        warn("Not enough listening data yet. Play some songs first!")
+        warn("Need at least 5 songs to generate recommendations")
+        return
+    print(f"\n{C.CYAN}We think you'll like these:{C.RESET}\n")
+    for i, (title, url, reason) in enumerate(recommendations, 1):
+        print(f"  {C.GREEN}{i}.{C.RESET} {title[:60]}")
+        print(f"     {C.DIM}→ {reason}{C.RESET}")
+    print(f"\n  {C.YELLOW}s{C.RESET}. Suggest more (different algorithm)")
+    print(f"  {C.YELLOW}a{C.RESET}. Add all to queue")
+    print(f"  {C.YELLOW}0{C.RESET}. Back")
+    choice = input(f"\n{C.WHITE}Pick number to play, or command: {C.RESET}").strip().lower()
+    if choice == 's':
+        # Switch algorithm and try again
+        taste = load_taste_profile()
+        algo_cycle = ["keyword_based", "artist_based", "hybrid"]
+        current = taste["recommendation_settings"]["algorithm"]
+        next_algo = algo_cycle[(algo_cycle.index(current) + 1) % len(algo_cycle)]
+        taste["recommendation_settings"]["algorithm"] = next_algo
+        save_taste_profile(taste)
+        info(f"Switched to {next_algo} algorithm, regenerating...")
+        show_daily_suggestions(cfg)
+        return
+    elif choice == 'a':
+        for title, url, reason in recommendations:
+            # Download or stream?
+            if cfg.get("stream_mode", False):
+                stream_url, _ = get_stream_url(title, cfg, 0)
+                if stream_url:
+                    add_to_queue(stream_url, title)
+            else:
+                file_path, _ = search_and_download(title, cfg, 0)
+                if file_path:
+                    add_to_queue(file_path, title)
+        ok(f"Added {len(recommendations)} songs to queue")
+        if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+            play_queue(cfg)
+        return
+    elif choice.isdigit() and 1 <= int(choice) <= len(recommendations):
+        title, url, reason = recommendations[int(choice)-1]
+        info(f"Playing: {title}")
+        play_stream(title, "once", None, cfg)
+        # Update taste with this recommendation interaction
+        taste = load_taste_profile()
+        taste["unique_songs"].setdefault(f"rec_{title}", {})
+        taste["unique_songs"][f"rec_{title}"]["from_recommendation"] = True
+        save_taste_profile(taste)
+
+
 # ─────────────────────────────────────────────
 #  ANSI COLORS
 # ─────────────────────────────────────────────
@@ -994,6 +1256,20 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
         proc.terminate()
         print()
         warn("Interrupted")
+        # Don't track taste if user forcefully interrupted early
+        return
+
+    # Track taste after successful playback (not interrupted)
+    try:
+        if not str(file_path).startswith(('http://', 'https://')):
+            update_taste_profile(title, file_path)
+        else:
+            update_taste_profile(title, file_path, played_duration=30)
+    except Exception as e:
+        if DEBUG:
+            dprint(f"Taste tracking skipped: {e}")
+
+
 
     finally:
         if cfg.get("wake_lock"):
@@ -1121,10 +1397,6 @@ def pause():
     db["state"]["playing"] = False
     save_db(db)
     ok("Paused")
-
-def set_queue(db, name):
-    db["queues"].setdefault(name, [])
-    db["state"]["current_queue"] = name
 
 def clear_queue(queue_name=None):
     db = load_db()
@@ -1607,6 +1879,220 @@ def queue_menu(cfg):
     elif action == "0":
         return
 
+def display_taste_summary(taste):
+    """Display taste profile in clean, readable format"""
+    clear_screen()
+    
+    print(f"\n{C.CYAN}{C.BOLD}🎵 YOUR MUSICAL DNA{C.RESET}\n")
+    
+    # Basic stats
+    print(f"{C.GREEN}📊 Your Stats:{C.RESET}")
+    print(f"   Total plays:    {taste['total_plays']}")
+    print(f"   Unique songs:   {len(taste['unique_songs'])}")
+    print(f"   Unique artists: {len(taste['artist_stats'])}")
+    
+    # Top artists (if any)
+    if taste['artist_stats']:
+        print(f"\n{C.YELLOW}🎤 Your Top Artists:{C.RESET}")
+        top_artists = sorted(taste['artist_stats'].items(), 
+                            key=lambda x: x[1]['plays'], reverse=True)[:5]
+        for i, (artist, stats) in enumerate(top_artists, 1):
+            bar = "▰" * min(20, stats['plays'])
+            print(f"   {i}. {artist[:30]:<30} {bar} {stats['plays']}")
+    
+    # Top keywords (if any)
+    if taste['keyword_stats']:
+        print(f"\n{C.MAGENTA}🔑 Your Music Keywords:{C.RESET}")
+        top_keywords = sorted(taste['keyword_stats'].items(), 
+                             key=lambda x: x[1], reverse=True)[:5]
+        for keyword, count in top_keywords:
+            print(f"   • {keyword}: {count} times")
+    
+    # Listening patterns (if enough data)
+    if taste['total_plays'] > 5:
+        print(f"\n{C.BLUE}⏰ When You Listen Most:{C.RESET}")
+        patterns = taste['listening_patterns']
+        total = sum(patterns.values())
+        if total > 0:
+            morning = int((patterns['morning'] / total) * 100)
+            afternoon = int((patterns['afternoon'] / total) * 100)
+            evening = int((patterns['evening'] / total) * 100)
+            night = int((patterns['night'] / total) * 100)
+            print(f"   🌅 Morning:  {morning}%")
+            print(f"   ☀️ Afternoon: {afternoon}%")
+            print(f"   🌙 Evening:  {evening}%")
+            print(f"   🌃 Night:    {night}%")
+    
+    # Settings summary
+    print(f"\n{C.CYAN}⚙️ Active Settings:{C.RESET}")
+    algo_names = {"keyword_based": "Keyword-based", "artist_based": "Artist-based", "hybrid": "Hybrid"}
+    print(f"   Recommendation: {algo_names.get(taste['recommendation_settings']['algorithm'], 'Hybrid')}")
+    
+    if taste['preferences']['preferred_mood']:
+        print(f"   Mood filter:    {taste['preferences']['preferred_mood'].title()}")
+    if taste['preferences']['preferred_language']:
+        print(f"   Language filter: {taste['preferences']['preferred_language'].title()}")
+    
+    # Blacklist info (if anything blacklisted)
+    blacklist_count = len(taste['blacklist']['artists']) + len(taste['blacklist']['keywords'])
+    if blacklist_count > 0:
+        print(f"\n{C.RED}🚫 Blocked items: {blacklist_count}{C.RESET}")
+    
+    # Tip for new users
+    if taste['total_plays'] == 0:
+        print(f"\n{C.YELLOW}💡 Tip: Play some songs first and your taste profile will build automatically!{C.RESET}")
+    
+    print(f"\n{C.DIM}Press Enter to continue...{C.RESET}")
+    input()
+
+def _get_mood_emoji(mood):
+    """Return emoji for mood type"""
+    if not mood:
+        return "🎵"
+    emojis = {
+        "calm": "😌",
+        "energetic": "⚡", 
+        "sad": "😢",
+        "happy": "😊"
+    }
+    return emojis.get(mood, "🎵")
+
+def _get_algo_name(algo):
+    """Return readable algorithm name"""
+    if not algo:
+        return "Hybrid"
+    names = {
+        "keyword_based": "🔑 Keywords",
+        "artist_based": "🎤 Artists",
+        "hybrid": "🧬 Hybrid"
+    }
+    return names.get(algo, "Hybrid")
+
+def taste_menu(cfg):
+    """Interactive taste profile management"""
+    while True:
+        taste = load_taste_profile()
+        head("🎨 Taste Profile Manager")
+        # Display stats
+        print(f"{C.CYAN}📊 Your Music DNA:{C.RESET}")
+        print(f"   Total songs played: {taste['total_plays']}")
+        print(f"   Unique songs: {len(taste['unique_songs'])}")
+        print(f"   Unique artists: {len(taste['artist_stats'])}")
+        if taste['artist_stats']:
+            top_artist = sorted(taste['artist_stats'].items(), 
+                               key=lambda x: x[1]['plays'], reverse=True)[0]
+            print(f"   Top artist: {top_artist[0]} ({top_artist[1]['plays']} plays)")
+        if taste['keyword_stats']:
+            top_keyword = sorted(taste['keyword_stats'].items(), 
+                                key=lambda x: x[1], reverse=True)[0]
+            print(f"   Top keyword: {top_keyword[0]} ({top_keyword[1]} times)")
+        print(f"\n   Active algorithm: {taste['recommendation_settings']['algorithm']}")
+        print(f"\n{C.CYAN}Options:{C.RESET}")
+        print("   1. View detailed taste profile")
+        print("   2. Change recommendation algorithm")
+        print("   3. Reset entire taste profile (clear all data)")
+        print("   4. Remove specific song from taste memory")
+        print("   5. Blacklist artist/song/keyword")
+        print("   6. Set preferences (mood, language, duration)")
+        print("   7. Export taste data to JSON")
+        print("   8. Show today's recommendations")
+        print("   0. Back")
+        choice = input(f"\n{C.WHITE}Choose: {C.RESET}").strip()
+
+        if choice == "1":
+            display_taste_summary(taste)
+        elif choice == "2":
+            # Change algorithm
+            new_algo = choose("Select algorithm", [
+                ("1", "Keyword-based (recommends by music terms you like)"),
+                ("2", "Artist-based (recommends similar artists)"),
+                ("3", "Hybrid (combines both)")
+            ])
+            algo_map = {"1": "keyword_based", "2": "artist_based", "3": "hybrid"}
+            taste["recommendation_settings"]["algorithm"] = algo_map[new_algo]
+            save_taste_profile(taste)
+            ok(f"Algorithm switched to {algo_map[new_algo]}")
+        elif choice == "3":
+            # Reset all taste data
+            confirm = input(f"{C.RED}⚠️  Delete ALL taste data? Type 'yes' to confirm: {C.RESET}")
+            if confirm.lower() == 'yes':
+                os.remove(TASTE_PATH) if TASTE_PATH.exists() else None
+                ok("Taste profile reset. Start fresh!")
+            else:
+                warn("Cancelled")
+        elif choice == "4":
+            # Remove specific song
+            if not taste['unique_songs']:
+                warn("No songs in taste profile")
+                continue
+            songs = list(taste['unique_songs'].items())
+            print(f"\n{C.CYAN}Select song to remove:{C.RESET}")
+            for i, (_, data) in enumerate(songs[:20], 1):
+                print(f"  {i}. {data['title'][:50]} ({data['play_count']} plays)")
+            idx = input(f"\n{C.WHITE}Number to remove (0 to cancel): {C.RESET}")
+            if idx.isdigit() and 1 <= int(idx) <= len(songs):
+                song_key, song_data = songs[int(idx)-1]
+                del taste['unique_songs'][song_key]
+                save_taste_profile(taste)
+                ok(f"Removed '{song_data['title']}' from taste profile")
+        elif choice == "5":
+            # Blacklist management
+            black_action = choose("Blacklist action", [
+                ("1", "Add artist to blacklist"),
+                ("2", "Add keyword to blacklist"),
+                ("3", "View blacklist"),
+                ("4", "Clear blacklist")
+            ])
+            if black_action == "1":
+                artist = input(f"{C.WHITE}Artist name to blacklist: {C.RESET}").strip()
+                if artist and artist not in taste["blacklist"]["artists"]:
+                    taste["blacklist"]["artists"].append(artist)
+                    save_taste_profile(taste)
+                    ok(f"Blacklisted: {artist}")
+            elif black_action == "2":
+                keyword = input(f"{C.WHITE}Keyword to blacklist: {C.RESET}").strip()
+                if keyword and keyword not in taste["blacklist"]["keywords"]:
+                    taste["blacklist"]["keywords"].append(keyword)
+                    save_taste_profile(taste)
+                    ok(f"Blacklisted keyword: {keyword}")
+            elif black_action == "3":
+                head("Blacklist")
+                print(f"Artists: {taste['blacklist']['artists'] or 'None'}")
+                print(f"Songs: {taste['blacklist']['songs'] or 'None'}")
+                print(f"Keywords: {taste['blacklist']['keywords'] or 'None'}")
+                input(f"{C.DIM}Press Enter...{C.RESET}")
+            elif black_action == "4":
+                if input(f"{C.RED}Clear all blacklists? [y/N]: {C.RESET}").lower() == 'y':
+                    taste["blacklist"] = {"artists": [], "songs": [], "keywords": []}
+                    save_taste_profile(taste)
+                    ok("Blacklist cleared")
+        elif choice == "6":
+            # Set preferences
+            head("Set Preferences")
+            mood = choose("Preferred mood (optional)", [
+                ("1", "Calm/Spiritual"),
+                ("2", "Energetic"),
+                ("3", "Sad"),
+                ("4", "Happy"),
+                ("0", "None")
+            ])
+            mood_map = {"1": "calm", "2": "energetic", "3": "sad", "4": "happy", "0": None}
+            taste["preferences"]["preferred_mood"] = mood_map[mood]
+            lang = input(f"{C.WHITE}Preferred language (urdu/hindi/punjabi/english) or press Enter to skip: {C.RESET}")
+            if lang.lower() in ['urdu', 'hindi', 'punjabi', 'english']:
+                taste["preferences"]["preferred_language"] = lang.lower()
+            save_taste_profile(taste)
+            ok("Preferences saved")
+        elif choice == "7":
+            # Export taste data
+            export_path = Path.home() / f"musicloop_taste_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(export_path, 'w') as f:
+                json.dump(taste, f, indent=2, default=str)
+            ok(f"Taste data exported to {export_path}")
+        elif choice == "8":
+            show_daily_suggestions(cfg)
+        elif choice == "0":
+            break
 
 def interactive_menu(cfg):
     while True:
@@ -1620,8 +2106,10 @@ def interactive_menu(cfg):
             ("6", "Queue management"),
             ("7", "Daemon mode (background play)"),
             ("8", "Settings"),
-            ("9", "Clear screen"),
-            ("10", "Exit"),
+            ("a", "Today's recommendations"),
+            ("b","Your taste profile"),
+            ("c", "Clear screen"),
+            ("d", "Exit"),
           ])
 
         if action == "1":
@@ -1764,11 +2252,15 @@ def interactive_menu(cfg):
         elif action == "8":
             cfg = settings_menu(cfg)   # [Fix #5] capture returned cfg
 
-        elif action == "9":
+        elif action == "a":
+            show_daily_suggestions(cfg)
+        elif action == "b":
+            taste_menu(cfg)
+        elif action == "c":
             clear_screen()
             banner()
 
-        elif action == "10":
+        elif action == "d":
             print(f"\n{C.CYAN}Ya Ali a.s madad 🎵{C.RESET}\n")
             sys.exit(0)
 
