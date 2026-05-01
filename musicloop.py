@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════╗
-║      MUSICLOOP — Termux Edition v2.1         ║
+║      MUSICLOOP — Termux Edition v2.2         ║
 ║   Hardened · Streaming · Daemon-ready        ║
 ╚══════════════════════════════════════════════╝
 
@@ -76,6 +76,8 @@ def save_config(cfg):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
 
+def clear_screen():
+    os.system("cls" if os.name == 'nt' else "clear")
 
 # ─────────────────────────────────────────────
 #  ANSI COLORS
@@ -95,7 +97,7 @@ class C:
 def banner():
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════╗
-║           🎧 MUSICLOOP v2.1              ║
+║           🎧 MUSICLOOP v2.2              ║
 ║         Termux Edition · Hardened        ║
 ║          Streaming · Daemon Mode         ║
 ║                                          ║
@@ -232,22 +234,96 @@ def show_history():
 
     head("Recent Songs")
     for i, entry in enumerate(history[:15], 1):
-        exists = "✔" if os.path.exists(entry["path"]) else "✘"
+        exists = "✔" if os.path.exists(entry.get("path", "")) else "✘"
         color = C.GREEN if exists == "✔" else C.RED
+        title = entry.get("title", "Unknown Title")[:50]
+        date = entry.get("date", "Unknown Date")
         print(f"  {C.DIM}{i:2}.{C.RESET} {color}{exists}{C.RESET} "
-              f"{entry['title'][:50]:<50} {C.DIM}{entry['date']}{C.RESET}")
+              f"{title:<50} {C.DIM}{date}{C.RESET}")
 
     print()
-    choice = input(f"{C.CYAN}Pick number to play (or Enter to skip): {C.RESET}").strip()
-    if choice.isdigit():
-        idx = int(choice) - 1
-        if 0 <= idx < len(history):
-            path = history[idx]["path"]
-            if os.path.exists(path):
-                return path
-            err("File no longer exists at that path.")
-    return None
+    print(f"{C.CYAN}Commands: {C.RESET}number (play), {C.CYAN}q 1 2 3{C.RESET} (add to queue), "
+          f"{C.CYAN}qp 1-5{C.RESET} (add & play), {C.CYAN}Enter{C.RESET} (skip)")
+    choice = input(f"{C.CYAN}> {C.RESET}").strip()
+    if not choice:
+        return None
+    parts = choice.split(maxsplit=1)
+    cmd = parts[0].lower() if parts else ""
+    arg_str = parts[1] if len(parts) > 1 else ""
+    if cmd in ["q", "queue", "a", "add"]:
+        action = "queue"
+        indices_str = arg_str
+    elif cmd in ["qp", "queueplay"]:
+        action = "queueplay"
+        indices_str = arg_str
+    else:
+        action = "play"
+        indices_str = cmd if cmd.isdigit() or '-' in cmd or ',' in cmd else choice
 
+    selected_indices = set()
+    if indices_str:
+        for part in indices_str.replace(',', ' ').split():
+            if '-' in part:
+                try:
+                    start, end = map(int, part.split('-'))
+                    selected_indices.update(range(start, end + 1))
+                except ValueError:
+                    err(f"Invalid range: {part}")
+                    return None
+            elif part.isdigit():
+                selected_indices.add(int(part))
+            else:
+                err(f"Invalid input: {part}")
+                return None
+    if not selected_indices:
+        err("No valid indices provided")
+        return None
+    valid_paths = []
+    valid_titles = []
+    missing_count = 0
+    for idx in sorted(selected_indices):
+        if idx < 1 or idx > len(history):
+            warn(f"Index {idx} out of range (1-{len(history)})")
+            continue
+        entry = history[idx - 1]
+        path = entry.get("path", "")
+        title = entry.get("title", "Unknown")
+        if os.path.exists(path):
+            valid_paths.append({"path": path, "title": title})
+            valid_titles.append(f"#{idx}: {title[:40]}")
+        else:
+            missing_count += 1
+            warn(f"#{idx}: {title} - file missing")
+    if not valid_paths:
+        err("No valid files found")
+        return None
+    if action == "play":
+        if len(valid_paths) > 1:
+            info(f"Multiple selections in play mode. Using first: {valid_paths[0]['title']}")
+        return valid_paths[0]["path"]
+    elif action == "queue":
+        for item in valid_paths:
+            add_to_queue(item["path"], item["title"])
+        msg = f"Added {len(valid_paths)} songs to queue"
+        if missing_count:
+            msg += f" ({missing_count} missing, skipped)"
+        ok(msg)
+        if len(valid_paths) == 1:
+            return valid_paths[0]["path"]
+        return {"action": "queue_added", "count": len(valid_paths)}
+    elif action == "queueplay":
+        for item in valid_paths:
+            add_to_queue(item["path"], item["title"])
+        msg = f"Added {len(valid_paths)} songs to queue"
+        if missing_count:
+            msg += f" ({missing_count} missing, skipped)"
+        ok(msg)
+
+        if valid_paths:
+            info("Starting queue playback...")
+            return valid_paths[0]["path"]
+
+    return None
 
 # ─────────────────────────────────────────────
 #  QUEUE  [Fix #4: remove by index, move up/down]
@@ -422,22 +498,28 @@ def set_mode(mode):
 
 
 def next_index(db, q):
-    st = db["state"]
-    mode = st["mode"]
-    i = st["index"]
-
+    """
+    Calculate next index based on current mode.
+    Returns new index without modifying db state.
+    """
     if not q:
         return 0
 
+    st = db["state"]
+    mode = st.get("mode", "normal")
+    current_idx = st.get("index", 0)
+
     if mode == "shuffle":
-        return random.randint(0, len(q) - 1)
+        new_idx = current_idx
+        while new_idx == current_idx and len(q) > 1:
+            new_idx = random.randint(0, len(q) - 1)
+        return new_idx
 
-    if mode == "repeat_all":
-        return (i + 1) % len(q)
+    elif mode == "repeat_all":
+        return (current_idx + 1) % len(q)
 
-    return min(i + 1, len(q) - 1)
-
-
+    else:
+        return min(current_idx + 1, len(q) - 1)
 
 # ─────────────────────────────────────────────
 #  DOWNLOAD WITH RETRY  [Fix #3]
@@ -490,33 +572,66 @@ def run_ytdlp_with_retry(cmd, cfg, label="Download"):
 
     return -1, None, "All retries exhausted"
 
+def search_results(query, limit=6):
+    """Return list of (title, url_or_id) from yt-dlp search"""
+    cmd = [
+        "yt-dlp", "--flat-playlist", "--print", "%(title)s|%(url)s",
+        "--no-playlist", "--limit", str(limit),
+        f"ytsearch{limit}:{query}"
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return []
 
-def search_and_download(query, cfg):
+        entries = []
+        for line in result.stdout.strip().split('\n'):
+            if '|' in line:
+                title, url = line.rsplit('|', 1)
+                entries.append((title.strip(), url.strip()))
+        return entries
+    except Exception:
+        return []
+
+
+def search_and_download(query, cfg, selected_idx=0):
     info(f"Searching: {C.BOLD}{query}{C.RESET}")
+    entries = search_results(query)
+    if not entries:
+        err("No results found")
+        return None, None
+    if selected_idx == 0 and len(entries) > 1:
+        head(f"Search results for: {query}")
+        for i, (title, _) in enumerate(entries[:6], 1):
+            print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
+        print(f"  {C.CYAN}0.{C.RESET} Cancel")
+        choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
+        if not choice.isdigit() or int(choice) == 0:
+            return None, None
+        selected_idx = int(choice) - 1
+    if selected_idx >= len(entries):
+        err("Invalid selection")
+        return None, None
+    title, url_or_id = entries[selected_idx]
+    info(f"Downloading: {title[:50]}")
     os.makedirs(cfg["download_dir"], exist_ok=True)
-
     cmd = [
         "yt-dlp", "-x",
         "--audio-format", cfg["audio_format"],
         "-o", f"{cfg['download_dir']}/%(title)s.%(ext)s",
         "--print", "after_move:filepath",
-        "--no-playlist", "--newline",
-        f"ytsearch1:{query}"
+        "--newline", url_or_id
     ]
-
-    rc, file_path, _ = run_ytdlp_with_retry(cmd, cfg, "Search+Download")
-
+    rc, file_path, _ = run_ytdlp_with_retry(cmd, cfg, "Download")
     if rc != 0 or not file_path or not os.path.exists(file_path):
         err("Could not download song.")
         return None, None
-
     title = Path(file_path).stem
     ok(f"Downloaded: {title}")
     if cfg.get("notify"):
         send_notification("🎵 Download Complete", title)
     save_to_history(title, file_path, "yt-dlp")
     return file_path, title
-
 
 def download_from_url(url, cfg):
     info("Downloading from URL...")
@@ -548,43 +663,61 @@ def download_from_url(url, cfg):
 #  STREAMING MODE  [Feature #7]
 # ─────────────────────────────────────────────
 
-def get_stream_url(query, cfg):
-    """Get direct audio stream URL via yt-dlp — no download."""
-    info(f"Fetching stream: {C.BOLD}{query}{C.RESET}")
+def get_stream_url(query, cfg, selected_idx=0):
+    """
+    DEPRECATED: Use direct resolution in interactive menu instead.
+    Kept for backward compatibility with CLI --stream flag.
+    Get direct audio stream URL — optional selection from results
+    """
+    entries = search_results(query)
+    if not entries:
+        err("No results found")
+        return None, None
 
-    retries = cfg.get("retry_count", 3)
-    delay   = cfg.get("retry_delay", 3)
+    # Only show selection if no index provided or index is 0
+    if selected_idx <= 0:
+        head(f"Search results for: {query}")
+        for i, (title, _) in enumerate(entries[:6], 1):
+            print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
+        print(f"  {C.CYAN}0.{C.RESET} Cancel")
+        choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
+        if not choice.isdigit() or int(choice) == 0:
+            return None, None
+        selected_idx = int(choice) - 1
+    else:
+        selected_idx = selected_idx  # Use provided index (0-based)
 
-    cmd = ["yt-dlp", "-f", "bestaudio", "-g", "--no-playlist", f"ytsearch1:{query}"]
+    if selected_idx >= len(entries):
+        err("Invalid selection")
+        return None, None
 
-    for attempt in range(1, retries + 1):
-        if attempt > 1:
-            warn(f"Retry {attempt}/{retries} in {delay}s...")
-            time.sleep(delay)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                url = result.stdout.strip().split("\n")[0]
-                if url:
-                    ok("Stream URL ready")
-                    return url
-            # [Fix #2] always log failures
-            err(f"Stream fetch failed (attempt {attempt}): {result.stderr[:150].strip()}")
-        except subprocess.TimeoutExpired:
-            err(f"Timeout on attempt {attempt}")
-        except Exception as e:
-            err(f"Stream error (attempt {attempt}): {e}")  # [Fix #2]
+    title, url_or_id = entries[selected_idx]
+    info(f"Resolving stream for: {title[:50]}")
 
-    return None
+    # If it's a full URL, return directly
+    if url_or_id.startswith(('http://', 'https://')):
+        return url_or_id, title
+
+    # Otherwise resolve to stream URL
+    resolve_cmd = ["yt-dlp", "-f", "bestaudio", "-g", url_or_id]
+    try:
+        result = subprocess.run(resolve_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            stream_url = result.stdout.strip().split('\n')[0]
+            return stream_url, title
+    except Exception as e:
+        err(f"Resolution error: {e}")
+    return None, None
 
 
 def play_stream(query, loop_mode, loop_value, cfg):
     """Stream audio directly — zero storage used."""
-    stream_url = get_stream_url(query, cfg)
-    if not stream_url:
+    result = get_stream_url(query, cfg)
+    if not result:
         err("Could not get stream URL.")
         return
-    play_file(stream_url, loop_mode, loop_value, cfg, f"[STREAM] {query}")
+    stream_url, title = result
+    play_file(stream_url, loop_mode, loop_value, cfg, f"[STREAM] {title}")
 
 
 # ─────────────────────────────────────────────
@@ -771,7 +904,13 @@ def now_playing_display(title, mode_str):
 
 
 def play_file(file_path, loop_mode, loop_value, cfg, title=""):
-    title = title or Path(str(file_path)).stem
+    # Fix: Handle URLs gracefully (don't use Path() on them)
+    is_url = str(file_path).startswith(('http://', 'https://'))
+    if not title:
+        if is_url:
+            title = "Streaming Audio"
+        else:
+            title = Path(str(file_path)).stem
 
     mpv_cmd = [
         "mpv",
@@ -867,7 +1006,7 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
         except Exception:
             pass
 
-
+#fixed play queue function
 def play_queue(cfg, queue_name=None, auto_clear=False):
     db = load_db()
     qname = queue_name or current(db)
@@ -879,43 +1018,82 @@ def play_queue(cfg, queue_name=None, auto_clear=False):
 
     st = db["state"]
     st["playing"] = True
+    save_db(db)
 
     head(f"Playing [{qname}] mode={st['mode']}")
 
-    i = st["index"]
-
-    while i < len(q):
-        item = q[i]
+    current_idx = st.get("index", 0)
+    if current_idx >= len(q):
+        current_idx = 0
+        st["index"] = 0
+        save_db(db)
+    while current_idx < len(q) and st["playing"]:
+        item = q[current_idx]
         path = item["path"]
         title = item["title"]
+        if not path.startswith(('http://', 'https://')) and not Path(path).exists():
+            warn(f"Missing file: {title}")
+            if input(f"{C.CYAN}Remove from queue? [y/N]: {C.RESET}").lower() == 'y':
+                q.pop(current_idx)
+                save_db(db)
+                continue
+            else:
+                current_idx += 1
+                continue
+        info(f"[{current_idx+1}/{len(q)}] {title}")
+        st["index"] = current_idx
+        save_db(db)
+        play_file(path, "once", None, cfg, title)
+        db = load_db()
+        st = db["state"]
+        q = _q(db, qname)
+        if not st["playing"]:
+            warn("Playback stopped by user")
+            break
+        db["history"].insert(0, {
+            "title": title,
+            "path": str(path),
+            "source": "queue",
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+        db["history"] = db["history"][:50]
+        save_db(db)
+        mode = st["mode"]
 
-        if not Path(path).exists():
-            warn(f"Missing: {title}")
-            i += 1
-            continue
+        if mode == "shuffle":
+            remaining_indices = [i for i in range(len(q)) if i != current_idx]
+            if remaining_indices:
+                current_idx = random.choice(remaining_indices)
+            else:
+                current_idx = len(q)
+        elif mode == "repeat_all":
+            if current_idx + 1 >= len(q):
+                current_idx = 0
+                info("Repeating queue from start")
+            else:
+                current_idx += 1
 
-        info(f"[{i+1}/{len(q)}] {title}")
-
-        st["index"] = i
+        else:
+            current_idx += 1
+        st["index"] = current_idx
         save_db(db)
 
-        play_file(path, "once", None, cfg, title)
-
-        db["history"].append(item)
-
-        i = next_index(db, q)
-
-        if db["state"]["mode"] == "normal":
-            i += 1
-
+        if current_idx < len(q):
+            time.sleep(0.5)
     st["playing"] = False
-    st["index"] = 0
 
-    ok("Playback finished")
+    if current_idx >= len(q):
+        st["index"] = 0
+        ok("Queue playback completed")
+    else:
+        warn("Playback stopped before completing queue")
 
-    if auto_clear:
+    save_db(db)
+
+    if auto_clear and current_idx >= len(q):
         db["queues"][qname] = []
         save_db(db)
+        ok(f"Queue '{qname}' cleared")
 
 def stop():
     db = load_db()
@@ -924,6 +1102,12 @@ def stop():
     save_db(db)
     ok("Stopped")
 
+    try:
+        if os.path.exists(IPC_SOCKET):
+            mpv = MPVController()
+            mpv.quit()
+    except Exception:
+        pass
 
 def skip():
     db = load_db()
@@ -951,6 +1135,77 @@ def clear_queue(queue_name=None):
     db["queues"][qname] = []
     save_db(db)
     ok(f"Queue '{qname}' cleared")
+
+# ─────────────────────────────────────────────
+#  PLAYLIST SUPPORT  [New Feature]
+# ─────────────────────────────────────────────
+
+def parse_playlist(playlist_path):
+    """
+    Parse .m3u, .m3u8, .pls playlist files.
+    Returns list of (path, title) tuples.
+    """
+    playlist_path = Path(playlist_path)
+    if not playlist_path.exists():
+        err(f"Playlist not found: {playlist_path}")
+        return []
+    entries = []
+    ext = playlist_path.suffix.lower()
+    try:
+        with open(playlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        if ext in ['.m3u', '.m3u8']:
+            # Standard m3u - each line is a file path or URL
+            for line in lines:
+                if line and not line.startswith('#'):
+                    path = os.path.expanduser(line)
+                    title = Path(path).stem if not path.startswith(('http://', 'https://')) else "Stream"
+                    entries.append((path, title))
+        elif ext == '.pls':
+            # PLS format: File1=/path/to/song.mp3, Title1=Song Name
+            file_dict = {}
+            title_dict = {}
+            for line in lines:
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    if key.startswith('File'):
+                        idx = key[4:] if key[4:].isdigit() else '1'
+                        file_dict[idx] = value
+                    elif key.startswith('Title'):
+                        idx = key[5:] if key[5:].isdigit() else '1'
+                        title_dict[idx] = value
+            for idx in sorted(file_dict.keys()):
+                path = file_dict[idx]
+                title = title_dict.get(idx, Path(path).stem)
+                entries.append((path, title))
+        else:
+            err(f"Unsupported playlist format: {ext}")
+            return []
+    except Exception as e:
+        err(f"Error parsing playlist: {e}")
+        return []
+    ok(f"Loaded {len(entries)} tracks from playlist")
+    return entries
+
+def load_playlist_to_queue(playlist_path, queue_name=None):
+    """Load playlist entries into specified queue."""
+    entries = parse_playlist(playlist_path)
+    if not entries:
+        return False
+    db = load_db()
+    qname = queue_name or current(db)
+    q = _q(db, qname)
+
+    added = 0
+    for path, title in entries:
+        if os.path.exists(path) or path.startswith(('http://', 'https://')):
+            if not any(x["path"] == path for x in q):
+                q.append({"path": path, "title": title})
+                added += 1
+
+    save_db(db)
+    ok(f"Added {added}/{len(entries)} tracks to queue '{qname}'")
+    return added > 0
 
 # ─────────────────────────────────────────────
 #  DAEMON MODE  [Feature #8]
@@ -1160,6 +1415,7 @@ def parse_args():
     p.add_argument("--daemon",      action="store_true", help="Play in background")
     p.add_argument("--daemon-ctl",  metavar="ACTION",    help="pause|resume|stop|status|vol")
     p.add_argument("--daemon-val",  metavar="VALUE",     help="Value for vol")
+    p.add_argument("--load-playlist", metavar="FILE", help="Load .m3u/.pls playlist to queue")
 
     p.add_argument("--history", action="store_true")
     return p.parse_args()
@@ -1190,12 +1446,17 @@ def handle_args(args, cfg):
         return True
 
     if args.history:
-        path = show_history()
-        if path:
-            lm, lv = resolve_loop(args)
-            if lm is None:
-                lm, lv = get_loop_params(get_loop_mode())
-            play_file(path, lm, lv, cfg)
+        result = show_history()
+        if result:
+            if isinstance(result, dict) and result.get("action") == "queue_added":
+            # Queue was populated, optionally start playing
+                if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+                    play_queue(cfg)
+            elif isinstance(result, str):
+                lm, lv = resolve_loop(args)
+                if lm is None:
+                    lm, lv = get_loop_params(get_loop_mode())
+                play_file(result, lm, lv, cfg)
         return True
 
     if args.stream:
@@ -1227,7 +1488,11 @@ def handle_args(args, cfg):
         if lm is None:
             lm, lv = get_loop_params(get_loop_mode())
         play_file(file_path, lm, lv, cfg, title)
-
+    if args.load_playlist:
+        if load_playlist_to_queue(args.load_playlist):
+            if args.queue_play:
+                play_queue(cfg)
+        return True
     return True
 
 
@@ -1251,6 +1516,7 @@ def queue_menu(cfg):
             ("6", "Move item down"),
             ("7", "Clear current queue"),
             ("8", "Switch queue"),
+            ("a", "Load playlist( .m3u/.pls)"),
             ("9", "List all queues"),
             ("0", "Back"),
         ]
@@ -1329,6 +1595,14 @@ def queue_menu(cfg):
         head("All Queues")
         for name, items in queues.items():
             print(f" - {name} ({len(items)})")
+    elif action == "a":
+        playlist_path = input(f"{C.WHITE}Playlist file path: {C.RESET}").strip()
+        if not playlist_path:
+            return
+        playlist_path = os.path.expanduser(playlist_path)
+        if load_playlist_to_queue(playlist_path):
+            if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+                play_queue(cfg)
 
     elif action == "0":
         return
@@ -1346,8 +1620,9 @@ def interactive_menu(cfg):
             ("6", "Queue management"),
             ("7", "Daemon mode (background play)"),
             ("8", "Settings"),
-            ("9", "Exit"),
-        ])
+            ("9", "Clear screen"),
+            ("10", "Exit"),
+          ])
 
         if action == "1":
             query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
@@ -1362,9 +1637,54 @@ def interactive_menu(cfg):
 
         elif action == "2":
             query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
-            if not query: continue
             lm, lv = get_loop_params(get_loop_mode())
-            play_stream(query, lm, lv, cfg)
+            if not query:
+                err('no input given')
+                continue
+
+            # Get search results once
+            entries = search_results(query)
+            if not entries:
+                err("No results found")
+                continue
+
+            # Display results
+            head(f"Results for: {query}")
+            for i, (title, _) in enumerate(entries[:6], 1):
+                print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
+            print(f"  {C.CYAN}0.{C.RESET} Cancel")
+
+            # Get user choice
+            choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
+            if not choice.isdigit() or int(choice) == 0:
+                continue
+
+            selected_idx = int(choice) - 1
+            if selected_idx >= len(entries):
+                err("Invalid selection")
+                continue
+
+            # Get the selected entry
+            title, url_or_id = entries[selected_idx]
+            info(f"Selected: {title[:50]}")
+
+            # Get stream URL without re-searching (use the URL/ID we already have)
+            if url_or_id.startswith(('http://', 'https://')):
+                stream_url = url_or_id
+            else:
+                # Resolve to actual stream URL
+                resolve_cmd = ["yt-dlp", "-f", "bestaudio", "-g", url_or_id]
+                try:
+                    result = subprocess.run(resolve_cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0:
+                        stream_url = result.stdout.strip().split('\n')[0]
+                    else:
+                        err("Could not resolve stream URL")
+                        continue
+                except Exception as e:
+                        err(f"Stream resolution failed: {e}")
+                        continue
+            play_file(stream_url, lm, lv, cfg, f"[STREAM] {title}")
 
         elif action == "3":
             url = input(f"\n{C.WHITE}URL: {C.RESET}").strip()
@@ -1418,10 +1738,14 @@ def interactive_menu(cfg):
             play_file(fp, lm, lv, cfg, title)
 
         elif action == "5":
-            path = show_history()
-            if path:
-                lm, lv = get_loop_params(get_loop_mode())
-                play_file(path, lm, lv, cfg, Path(path).stem)
+            result = show_history()
+            if result:
+                if isinstance(result, dict) and result.get("action") == "queue_added":
+                    if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+                        play_queue(cfg)
+                elif isinstance(result, str):
+                    lm, lv = get_loop_params(get_loop_mode())
+                    play_file(result, lm, lv, cfg, Path(result).stem)
 
         elif action == "6":
             queue_menu(cfg)
@@ -1441,6 +1765,10 @@ def interactive_menu(cfg):
             cfg = settings_menu(cfg)   # [Fix #5] capture returned cfg
 
         elif action == "9":
+            clear_screen()
+            banner()
+
+        elif action == "10":
             print(f"\n{C.CYAN}Ya Ali a.s madad 🎵{C.RESET}\n")
             sys.exit(0)
 
