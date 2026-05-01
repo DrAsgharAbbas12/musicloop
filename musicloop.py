@@ -1,56 +1,83 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════╗
-║      MUSICLOOP — Termux Edition v2.2         ║
+║         MUSICLOOP — Termux Edition v3.0      ║
 ║   Hardened · Streaming · Daemon-ready        ║
+║   Taste Engine · Smart Queue · Playlist      ║
 ╚══════════════════════════════════════════════╝
 
-Author: Dr. Asghar Abbas Askari
-MBBS Year 1 — Nishtar Medical University Multan
+Author  : Dr. Asghar Abbas Askari
+          MBBS Year 1 — Nishtar Medical University Multan
 
-
-Fixes in v2.1:
-  [1] Non-blocking tty input (raw mode) for controls
-  [2] IPC errors now logged, not swallowed
-  [3] yt-dlp retry logic (3 attempts + timeout)
-  [4] Queue: remove by index, move up/down
-  [5] settings_menu properly returns cfg
-  [6] Per-process IPC socket (no multi-instance conflicts)
-  [7] Streaming mode (instant play, no download)
-  [8] Background daemon mode (play + detach)
+Changelog v3.0 (vs v2.2):
+  [FIX-1]  search_results(): removed invalid --limit yt-dlp flag
+           (was breaking ALL searches silently)
+  [FIX-2]  get_file_path(): rewrote broken dual-path logic
+           (was building path_of_file but checking wrong var → infinite loop)
+  [FIX-3]  play_file(): moved taste-tracking INSIDE try-block and fixed
+           orphan finally that ran wake_lock release before tracking
+  [FIX-4]  handle_args(): moved args.load_playlist check BEFORE early returns
+           (was unreachable dead code — never executed)
+  [FIX-5]  stop(): now attempts IPC quit before falling back to pid kill
+  [FIX-6]  next_index(): now actually wired into play_queue (was dead code)
+  [FIX-7]  DEBUG flag: now auto-detects via env var MUSICLOOP_DEBUG
+  [FIX-8]  play_file(): removed duplicate socket-remove before Popen
+           and added proper IPC socket guard timing
+  [FIX-9]  queue_menu action "8": removed unreachable post-selection code
+  [NEW-1]  Smart search cache: avoids re-searching same query in one session
+  [NEW-2]  Playback progress bar with elapsed / total time via IPC
+  [NEW-3]  Sleep timer: auto-stop after N minutes (separate from loop-time)
+  [NEW-4]  Equalizer presets: bass-boost, vocal-clarity, flat via mpv af
+  [NEW-5]  Download manager: shows queue of pending downloads with cancel
+  [NEW-6]  Batch download: search → select multiple → download all
+  [NEW-7]  Song info panel: bitrate, duration, format from yt-dlp --dump-json
+  [NEW-8]  Playlist export: save current queue as .m3u file
+  [NEW-9]  Multi-queue rename/delete/copy operations
+  [NEW-10] Interactive search with arrow-key style numbered nav
+  [NEW-11] Volume memory: per-song last-used volume saved in taste profile
+  [NEW-12] Seek support: forward/backward 10s via IPC seek command
+  [NEW-13] --interactive flag forces menu mode even when other flags given
+  [NEW-14] Statistics summary in main menu header
 """
 
-import random
-import subprocess
-import time
-import os
-import sys
+# ─────────────────────────────────────────────
+#  STDLIB IMPORTS
+# ─────────────────────────────────────────────
+import argparse
 import glob
 import json
-import argparse
-import threading
-import socket
-import tty
-import termios
+import os
+import random
 import select
+import socket
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import tty
 from datetime import datetime
 from pathlib import Path
-import tempfile
+
 # ─────────────────────────────────────────────
 #  PATHS & CONFIG
 # ─────────────────────────────────────────────
 
 CONFIG_PATH  = Path.home() / ".musicloop.json"
 HISTORY_PATH = Path.home() / ".musicloop_history.json"
-DB_PATH   = Path.home() / ".musicloop_queue.json"
+DB_PATH      = Path.home() / ".musicloop_queue.json"
+TASTE_PATH   = Path.home() / ".musicloop_taste.json"
 DAEMON_PID   = Path.home() / ".musicloop_daemon.pid"
 DAEMON_SOCK  = Path.home() / ".musicloop_daemon.sock"
 
-# Per-process socket — no multi-instance conflicts [Fix #6]
-
+# Per-process socket — no multi-instance conflicts
 IPC_SOCKET = os.path.join(tempfile.gettempdir(), f"mpv_{os.getpid()}.sock")
 
-DEFAULT_DOWNLOAD_DIR = "/data/data/com.termux/files/home/storage/downloads"
+DEFAULT_DOWNLOAD_DIR = "/data/data/com.termux/files/home/storage/downloads/songs"
+
+# [FIX-7] DEBUG driven by env var, not hardcoded
+DEBUG = os.environ.get("MUSICLOOP_DEBUG", "").lower() in ("1", "true", "yes")
 
 DEFAULT_CONFIG = {
     "download_dir": DEFAULT_DOWNLOAD_DIR,
@@ -60,10 +87,15 @@ DEFAULT_CONFIG = {
     "wake_lock": True,
     "retry_count": 3,
     "retry_delay": 3,
+    "stream_mode": False,
+    "eq_preset": "flat",          # [NEW-4] equalizer preset
 }
 
+# In-session search cache [NEW-1]
+_search_cache: dict[str, list] = {}
 
-def load_config():
+
+def load_config() -> dict:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             base = DEFAULT_CONFIG.copy()
@@ -72,273 +104,13 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 
-def save_config(cfg):
+def save_config(cfg: dict) -> None:
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
 
-def clear_screen():
-    os.system("cls" if os.name == 'nt' else "clear")
 
-
-# ─────────────────────────────────────────────
-#  TASTE TRACKING & RECOMMENDATIONS (v2.3)
-# ─────────────────────────────────────────────
-
-TASTE_PATH = Path.home() / ".musicloop_taste.json"
-
-DEFAULT_TASTE = {
-    "user_id": "default",
-    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "total_plays": 0,
-    "unique_songs": {},
-    "artist_stats": {},
-    "keyword_stats": {},
-    "listening_patterns": {
-        "morning": 0,    # 5am-12pm
-        "afternoon": 0,  # 12pm-5pm
-        "evening": 0,    # 5pm-9pm
-        "night": 0       # 9pm-5am
-    },
-    "recommendation_settings": {
-        "algorithm": "artist_based",  # keyword_based, artist_based, hybrid
-        "auto_recommend": True,
-        "daily_suggestions": 5
-    },
-    "blacklist": {
-        "artists": [],
-        "songs": [],
-        "keywords": []
-    },
-    "preferences": {
-        "preferred_mood": None,  # calm, energetic, sad, happy
-        "preferred_language": None,
-        "min_duration": 60,
-        "max_duration": 600
-    }
-}
-
-def load_taste_profile():
-    if TASTE_PATH.exists():
-        with open(TASTE_PATH, 'r') as f:
-            taste = json.load(f)
-            # Merge with defaults for new fields
-            for key, value in DEFAULT_TASTE.items():
-                if key not in taste:
-                    taste[key] = value
-            return taste
-    return DEFAULT_TASTE.copy()
-
-def save_taste_profile(taste):
-    taste["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    TASTE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(TASTE_PATH, 'w') as f:
-        json.dump(taste, f, indent=2)
-
-def extract_taste_features(song_title, artist=None, duration=None):
-    """Extract keywords, language, mood from song title"""
-    features = {
-        "keywords": [],
-        "language": "unknown",
-        "mood": "neutral",
-        "era": "unknown"
-    }
-    # Keyword extraction (common music terms)
-    common_keywords = ["remix", "cover", "live", "official", "video", 
-                       "audio", "slowed", "reverb", "sped up", "edit",
-                       "qawwali", "sufi", "classical", "pop", "rock"]
-    title_lower = song_title.lower()
-    for keyword in common_keywords:
-        if keyword in title_lower:
-            features["keywords"].append(keyword)
-    # Language detection (basic)
-    urdu_indicators = ["ali", "mola", "haq", "sher", "mardan", "qawwali", "sufi"]
-    hindi_indicators = ["jaan", "dil", "pyar", "ishq", "mohabbat"]
-    punjabi_indicators = ["tera", "mera", "sadda", "challa"]
-    for word in urdu_indicators:
-        if word in title_lower:
-            features["language"] = "urdu"
-            break
-    if features["language"] == "unknown":
-        for word in hindi_indicators:
-            if word in title_lower:
-                features["language"] = "hindi"
-                break
-    if features["language"] == "unknown":
-        for word in punjabi_indicators:
-            if word in title_lower:
-                features["language"] = "punjabi"
-                break
-    # Mood detection
-    calm_words = ["slow", "calm", "peaceful", "spiritual", "sufi", "qawwali"]
-    energetic_words = ["fast", "energetic", "dance", "party", "remix", "bass"]
-    sad_words = ["sad", "heartbreak", "lonely", "tears", "mourn"]
-    happy_words = ["happy", "joy", "celebrate", "fun", "smile"]
-    for word in calm_words:
-        if word in title_lower:
-            features["mood"] = "calm"
-            break
-    for word in energetic_words:
-        if word in title_lower:
-            features["mood"] = "energetic"
-            break
-    for word in sad_words:
-        if word in title_lower:
-            features["mood"] = "sad"
-            break
-    for word in happy_words:
-        if word in title_lower:
-            features["mood"] = "happy"
-            break
-    return features
-
-def update_taste_profile(song_title, path, played_duration=None, total_duration=None):
-    """Update user's taste profile based on played song"""
-    taste = load_taste_profile()
-    # Get or create song entry
-    song_key = str(path)
-    if song_key not in taste["unique_songs"]:
-        # New song - extract features
-        features = extract_taste_features(song_title)
-        taste["unique_songs"][song_key] = {
-            "title": song_title,
-            "play_count": 0,
-            "last_played": None,
-            "total_listened_sec": 0,
-            "features": features
-        }
-    song_data = taste["unique_songs"][song_key]
-    song_data["play_count"] += 1
-    song_data["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if played_duration and total_duration:
-        completion = played_duration / total_duration if total_duration > 0 else 0
-        song_data["total_listened_sec"] += played_duration
-        song_data["completion_rate"] = completion
-    # use first three words for artist proxy for now
-    artist = " ".join(song_title.split()[:2])
-    if artist not in taste["artist_stats"]:
-        taste["artist_stats"][artist] = {"plays": 0, "last_played": None}
-    taste["artist_stats"][artist]["plays"] += 1
-    taste["artist_stats"][artist]["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Update keyword stats
-    for keyword in song_data["features"]["keywords"]:
-        if keyword not in taste["keyword_stats"]:
-            taste["keyword_stats"][keyword] = 0
-        taste["keyword_stats"][keyword] += 1
-    # Update listening pattern based on current hour
-    current_hour = datetime.now().hour
-    if 5 <= current_hour < 12:
-        taste["listening_patterns"]["morning"] += 1
-    elif 12 <= current_hour < 17:
-        taste["listening_patterns"]["afternoon"] += 1
-    elif 17 <= current_hour < 21:
-        taste["listening_patterns"]["evening"] += 1
-    else:
-        taste["listening_patterns"]["night"] += 1
-    taste["total_plays"] += 1
-    save_taste_profile(taste)
-
-def get_daily_recommendations(limit=5):
-    """Generate personalized recommendations based on taste profile"""
-    taste = load_taste_profile()
-    settings = taste["recommendation_settings"]
-    recommendations = []
-    if settings["algorithm"] == "keyword_based":
-        # Get top keywords
-        top_keywords = sorted(taste["keyword_stats"].items(), 
-                             key=lambda x: x[1], reverse=True)[:3]
-        if top_keywords:
-            query = " ".join([kw[0] for kw in top_keywords])
-            results = search_results(query, limit=limit)
-            recommendations = [(title, url, f"Based on your interest in '{top_keywords[0][0]}'") 
-                              for title, url in results[:limit]]
-    elif settings["algorithm"] == "artist_based":
-        # Get top artist
-        top_artists = sorted(taste["artist_stats"].items(), 
-                            key=lambda x: x[1]["plays"], reverse=True)
-        if top_artists:
-            artist = top_artists[0][0]
-            query = f"{artist} songs"
-            results = search_results(query, limit=limit)
-            recommendations = [(title, url, f"Because you like {artist}") 
-                              for title, url in results[:limit]]
-    elif settings["algorithm"] == "hybrid":
-        # Combine keyword and artist results
-        kw_results = []
-        artist_results = []
-        top_keywords = sorted(taste["keyword_stats"].items(), 
-                             key=lambda x: x[1], reverse=True)[:2]
-        if top_keywords:
-            query = " ".join([kw[0] for kw in top_keywords])
-            kw_results = search_results(query, limit=3)
-        top_artists = sorted(taste["artist_stats"].items(), 
-                            key=lambda x: x[1]["plays"], reverse=True)
-        if top_artists:
-            artist = top_artists[0][0]
-            artist_results = search_results(f"{artist} songs", limit=3)
-        # Merge and deduplicate
-        seen = set()
-        for title, url in kw_results + artist_results:
-            if title not in seen and len(recommendations) < limit:
-                seen.add(title)
-                recommendations.append((title, url, "Hybrid recommendation"))
-    # Filter out blacklisted items
-    recommendations = [r for r in recommendations
-                      if not any(black in r[0].lower() for black in taste["blacklist"]["keywords"])]
-    return recommendations
-
-def show_daily_suggestions(cfg):
-    """Display today's recommendations and allow playing/adding to queue"""
-    head("🎵 Today's Recommendations")
-    info("Based on your listening taste profile")
-    recommendations = get_daily_recommendations(limit=7)
-    if not recommendations:
-        warn("Not enough listening data yet. Play some songs first!")
-        warn("Need at least 5 songs to generate recommendations")
-        return
-    print(f"\n{C.CYAN}We think you'll like these:{C.RESET}\n")
-    for i, (title, url, reason) in enumerate(recommendations, 1):
-        print(f"  {C.GREEN}{i}.{C.RESET} {title[:60]}")
-        print(f"     {C.DIM}→ {reason}{C.RESET}")
-    print(f"\n  {C.YELLOW}s{C.RESET}. Suggest more (different algorithm)")
-    print(f"  {C.YELLOW}a{C.RESET}. Add all to queue")
-    print(f"  {C.YELLOW}0{C.RESET}. Back")
-    choice = input(f"\n{C.WHITE}Pick number to play, or command: {C.RESET}").strip().lower()
-    if choice == 's':
-        # Switch algorithm and try again
-        taste = load_taste_profile()
-        algo_cycle = ["keyword_based", "artist_based", "hybrid"]
-        current = taste["recommendation_settings"]["algorithm"]
-        next_algo = algo_cycle[(algo_cycle.index(current) + 1) % len(algo_cycle)]
-        taste["recommendation_settings"]["algorithm"] = next_algo
-        save_taste_profile(taste)
-        info(f"Switched to {next_algo} algorithm, regenerating...")
-        show_daily_suggestions(cfg)
-        return
-    elif choice == 'a':
-        for title, url, reason in recommendations:
-            # Download or stream?
-            if cfg.get("stream_mode", False):
-                stream_url, _ = get_stream_url(title, cfg, 0)
-                if stream_url:
-                    add_to_queue(stream_url, title)
-            else:
-                file_path, _ = search_and_download(title, cfg, 0)
-                if file_path:
-                    add_to_queue(file_path, title)
-        ok(f"Added {len(recommendations)} songs to queue")
-        if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
-            play_queue(cfg)
-        return
-    elif choice.isdigit() and 1 <= int(choice) <= len(recommendations):
-        title, url, reason = recommendations[int(choice)-1]
-        info(f"Playing: {title}")
-        play_stream(title, "once", None, cfg)
-        # Update taste with this recommendation interaction
-        taste = load_taste_profile()
-        taste["unique_songs"].setdefault(f"rec_{title}", {})
-        taste["unique_songs"][f"rec_{title}"]["from_recommendation"] = True
-        save_taste_profile(taste)
+def clear_screen() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
 
 
 # ─────────────────────────────────────────────
@@ -355,62 +127,78 @@ class C:
     RED     = "\033[91m"
     MAGENTA = "\033[95m"
     WHITE   = "\033[97m"
+    BLUE    = "\033[94m"
 
-def banner():
+
+def banner() -> None:
+    db   = load_db()
+    hist = len(db.get("history", []))
+    q    = _q(db, current(db))
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════╗
-║           🎧 MUSICLOOP v2.2              ║
+║           🎧 MUSICLOOP v3.0              ║
 ║         Termux Edition · Hardened        ║
-║          Streaming · Daemon Mode         ║
+║         Streaming · Daemon · Smart       ║
 ║                                          ║
 ║              Programmed By:              ║
 ║          Dr. Asghar Abbas Askari         ║
 ╚══════════════════════════════════════════╝{C.RESET}
+{C.DIM}  Queue: {len(q)} songs  |  History: {hist} songs{C.RESET}
 """)
 
-def ok(msg):   print(f"{C.GREEN}✔  {msg}{C.RESET}")
-def err(msg):  print(f"{C.RED}✘  {msg}{C.RESET}")
-def info(msg): print(f"{C.CYAN}ℹ  {msg}{C.RESET}")
-def warn(msg): print(f"{C.YELLOW}⚠  {msg}{C.RESET}")
-def head(msg): print(f"\n{C.MAGENTA}{C.BOLD}── {msg} ──{C.RESET}")
+
+def ok(msg: str):   print(f"{C.GREEN}✔  {msg}{C.RESET}")
+def err(msg: str):  print(f"{C.RED}✘  {msg}{C.RESET}")
+def info(msg: str): print(f"{C.CYAN}ℹ  {msg}{C.RESET}")
+def warn(msg: str): print(f"{C.YELLOW}⚠  {msg}{C.RESET}")
+def head(msg: str): print(f"\n{C.MAGENTA}{C.BOLD}── {msg} ──{C.RESET}")
+def dprint(msg: str):
+    if DEBUG:
+        print(f"{C.DIM}[dbg] {msg}{C.RESET}")
 
 
 # ─────────────────────────────────────────────
 #  TERMUX INTEGRATIONS
 # ─────────────────────────────────────────────
 
-def termux_available(cmd):
+def termux_available(cmd: str) -> bool:
     return subprocess.run(["which", cmd], capture_output=True).returncode == 0
 
-def acquire_wake_lock():
+
+def acquire_wake_lock() -> None:
     if termux_available("termux-wake-lock"):
-        subprocess.Popen(["termux-wake-lock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["termux-wake-lock"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         info("Wake lock acquired")
 
-def release_wake_lock():
+
+def release_wake_lock() -> None:
     if termux_available("termux-wake-unlock"):
-        subprocess.run(["termux-wake-unlock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["termux-wake-unlock"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         info("Wake lock released")
 
-def send_notification(title, content):
+
+def send_notification(title: str, content: str) -> None:
     if termux_available("termux-notification"):
         subprocess.Popen(
-            ["termux-notification", "--title", title, "--content", content, "--id", "musicloop"],
+            ["termux-notification", "--title", title,
+             "--content", content, "--id", "musicloop"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
-def check_storage_permission():
+
+def check_storage_permission() -> bool:
     test = Path("/data/data/com.termux/files/home/storage/downloads")
     if not test.exists():
         warn("Storage not set up. Run: termux-setup-storage")
         return False
     return True
 
-def check_dependencies():
-    missing = []
-    for dep in ["mpv", "yt-dlp", "socat"]:
-        if not termux_available(dep):
-            missing.append(dep)
+
+def check_dependencies() -> None:
+    missing = [dep for dep in ["mpv", "yt-dlp", "socat"]
+               if not termux_available(dep)]
     if missing:
         err(f"Missing: {', '.join(missing)}")
         print(f"{C.DIM}Install via: pkg install {' '.join(missing)}{C.RESET}")
@@ -418,7 +206,7 @@ def check_dependencies():
 
 
 # ─────────────────────────────────────────────
-#  NON-BLOCKING TTY INPUT  [Fix #1]
+#  NON-BLOCKING TTY INPUT
 # ─────────────────────────────────────────────
 
 class RawInput:
@@ -444,8 +232,7 @@ class RawInput:
         if self.is_raw and self._old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
 
-    def read_key(self, timeout=0.2):
-        """Non-blocking read. Returns char or None."""
+    def read_key(self, timeout: float = 0.2) -> str | None:
         if not self.is_raw:
             return None
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -458,37 +245,38 @@ class RawInput:
 #  HISTORY
 # ─────────────────────────────────────────────
 
-def load_history():
+def load_history() -> list:
     if HISTORY_PATH.exists():
         with open(HISTORY_PATH) as f:
             return json.load(f)
     return []
 
-def save_to_history(title, path, source):
-    history = []
-    if HISTORY_PATH.exists():
-        with open(HISTORY_PATH) as f:
-            history = json.load(f)
-    history.insert(0, {
+
+def save_to_history(title: str, path, source: str) -> None:
+    history = load_history()
+    entry = {
         "title": title,
         "path": str(path),
         "source": source,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-    })
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    history.insert(0, entry)
     history = history[:50]
     with open(HISTORY_PATH, "w") as f:
         json.dump(history, f, indent=2)
+
+    # also mirror into DB history
     db = load_db()
-    db["history"].insert(0, {
-        "title": title,
-        "path": str(path),
-        "source": source,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-    })
+    db["history"].insert(0, entry)
     db["history"] = db["history"][:50]
     save_db(db)
 
+
 def show_history():
+    """
+    Display recent songs and handle multi-select / range commands.
+    Returns: path str (play), dict {action:queue_added} (queue), or None.
+    """
     history = load_history()
     if not history:
         info("No history yet.")
@@ -496,164 +284,126 @@ def show_history():
 
     head("Recent Songs")
     for i, entry in enumerate(history[:15], 1):
-        exists = "✔" if os.path.exists(entry.get("path", "")) else "✘"
-        color = C.GREEN if exists == "✔" else C.RED
-        title = entry.get("title", "Unknown Title")[:50]
-        date = entry.get("date", "Unknown Date")
+        exists  = "✔" if os.path.exists(entry.get("path", "")) else "✘"
+        color   = C.GREEN if exists == "✔" else C.RED
+        title   = entry.get("title", "Unknown")[:50]
+        date    = entry.get("date", "")
         print(f"  {C.DIM}{i:2}.{C.RESET} {color}{exists}{C.RESET} "
               f"{title:<50} {C.DIM}{date}{C.RESET}")
 
     print()
-    print(f"{C.CYAN}Commands: {C.RESET}number (play), {C.CYAN}q 1 2 3{C.RESET} (add to queue), "
-          f"{C.CYAN}qp 1-5{C.RESET} (add & play), {C.CYAN}Enter{C.RESET} (skip)")
+    print(f"{C.CYAN}Commands:{C.RESET} number (play)  "
+          f"{C.CYAN}q 1 2 3{C.RESET} (queue)  "
+          f"{C.CYAN}qp 1-5{C.RESET} (queue+play)  "
+          f"{C.CYAN}Enter{C.RESET} (back)")
     choice = input(f"{C.CYAN}> {C.RESET}").strip()
     if not choice:
         return None
-    parts = choice.split(maxsplit=1)
-    cmd = parts[0].lower() if parts else ""
-    arg_str = parts[1] if len(parts) > 1 else ""
-    if cmd in ["q", "queue", "a", "add"]:
-        action = "queue"
-        indices_str = arg_str
-    elif cmd in ["qp", "queueplay"]:
-        action = "queueplay"
-        indices_str = arg_str
-    else:
-        action = "play"
-        indices_str = cmd if cmd.isdigit() or '-' in cmd or ',' in cmd else choice
 
-    selected_indices = set()
-    if indices_str:
-        for part in indices_str.replace(',', ' ').split():
-            if '-' in part:
-                try:
-                    start, end = map(int, part.split('-'))
-                    selected_indices.update(range(start, end + 1))
-                except ValueError:
-                    err(f"Invalid range: {part}")
-                    return None
-            elif part.isdigit():
-                selected_indices.add(int(part))
-            else:
-                err(f"Invalid input: {part}")
-                return None
-    if not selected_indices:
-        err("No valid indices provided")
-        return None
-    valid_paths = []
-    valid_titles = []
-    missing_count = 0
-    for idx in sorted(selected_indices):
-        if idx < 1 or idx > len(history):
-            warn(f"Index {idx} out of range (1-{len(history)})")
-            continue
+    parts    = choice.split(maxsplit=1)
+    cmd      = parts[0].lower() if parts else ""
+    arg_str  = parts[1] if len(parts) > 1 else ""
+
+    if cmd in ("q", "queue", "a", "add"):
+        action, indices_str = "queue", arg_str
+    elif cmd in ("qp", "queueplay"):
+        action, indices_str = "queueplay", arg_str
+    else:
+        action      = "play"
+        indices_str = cmd if (cmd.isdigit() or "-" in cmd or "," in cmd) else choice
+
+    selected: set[int] = set()
+    for part in indices_str.replace(",", " ").split():
+        if "-" in part:
+            try:
+                a, b = map(int, part.split("-", 1))
+                selected.update(range(a, b + 1))
+            except ValueError:
+                err(f"Invalid range: {part}"); return None
+        elif part.isdigit():
+            selected.add(int(part))
+        else:
+            err(f"Invalid input: {part}"); return None
+
+    if not selected:
+        err("No valid indices provided"); return None
+
+    valid, missing_count = [], 0
+    for idx in sorted(selected):
+        if not (1 <= idx <= len(history)):
+            warn(f"Index {idx} out of range (1–{len(history)})"); continue
         entry = history[idx - 1]
-        path = entry.get("path", "")
+        path  = entry.get("path", "")
         title = entry.get("title", "Unknown")
         if os.path.exists(path):
-            valid_paths.append({"path": path, "title": title})
-            valid_titles.append(f"#{idx}: {title[:40]}")
+            valid.append({"path": path, "title": title})
         else:
             missing_count += 1
-            warn(f"#{idx}: {title} - file missing")
-    if not valid_paths:
-        err("No valid files found")
-        return None
+            warn(f"#{idx}: {title} — file missing")
+
+    if not valid:
+        err("No valid files found"); return None
+
     if action == "play":
-        if len(valid_paths) > 1:
-            info(f"Multiple selections in play mode. Using first: {valid_paths[0]['title']}")
-        return valid_paths[0]["path"]
-    elif action == "queue":
-        for item in valid_paths:
-            add_to_queue(item["path"], item["title"])
-        msg = f"Added {len(valid_paths)} songs to queue"
-        if missing_count:
-            msg += f" ({missing_count} missing, skipped)"
-        ok(msg)
-        if len(valid_paths) == 1:
-            return valid_paths[0]["path"]
-        return {"action": "queue_added", "count": len(valid_paths)}
-    elif action == "queueplay":
-        for item in valid_paths:
-            add_to_queue(item["path"], item["title"])
-        msg = f"Added {len(valid_paths)} songs to queue"
-        if missing_count:
-            msg += f" ({missing_count} missing, skipped)"
-        ok(msg)
+        if len(valid) > 1:
+            info(f"Multiple selections — using first: {valid[0]['title']}")
+        return valid[0]["path"]
 
-        if valid_paths:
-            info("Starting queue playback...")
-            return valid_paths[0]["path"]
+    for item in valid:
+        add_to_queue(item["path"], item["title"])
+    msg = f"Added {len(valid)} song(s) to queue"
+    if missing_count:
+        msg += f" ({missing_count} missing, skipped)"
+    ok(msg)
 
-    return None
+    if action == "queueplay" and valid:
+        info("Starting queue playback...")
+    return {"action": "queue_added", "count": len(valid)}
+
 
 # ─────────────────────────────────────────────
-#  QUEUE  [Fix #4: remove by index, move up/down]
+#  QUEUE  (full CRUD + rename/copy/export)
 # ─────────────────────────────────────────────
 
-def load_db():
+def load_db() -> dict:
     default_db = {
-        "queues": {"default": []},
-        "state": {
+        "queues":  {"default": []},
+        "state":   {
             "current_queue": "default",
-            "index": 0,
-            "mode": "normal",
-            "playing": False
+            "index":  0,
+            "mode":   "normal",
+            "playing": False,
         },
-        "history": []
+        "history": [],
     }
-
     if not DB_PATH.exists():
         return default_db
-
     try:
-        with open(DB_PATH, "r") as f:
+        with open(DB_PATH) as f:
             db = json.load(f)
-
-        # ---------------------------
-        # FIX: OLD FORMAT HANDLING
-        # ---------------------------
-
+        # migrate old list format
         if isinstance(db, list):
             warn("Old queue format detected. Migrating...")
-            db = {
-                "queues": {"default": db},
-                "state": {
-                    "current_queue": "default",
-                    "index": 0,
-                    "mode": "normal",
-                    "playing": False
-                },
-                "history": []
-            }
+            db = {**default_db, "queues": {"default": db}}
             save_db(db)
             return db
-
         if not isinstance(db, dict):
-            warn("Invalid DB format. Resetting.")
-            return default_db
-
-        # ensure structure exists
-        db.setdefault("queues", {"default": []})
-        db.setdefault("state", {})
+            warn("Invalid DB format. Resetting."); return default_db
+        db.setdefault("queues",  {"default": []})
+        db.setdefault("state",   {})
         db.setdefault("history", [])
-
-        db["state"].setdefault("current_queue", "default")
-        db["state"].setdefault("index", 0)
-        db["state"].setdefault("mode", "normal")
-        db["state"].setdefault("playing", False)
-
+        st = db["state"]
+        st.setdefault("current_queue", "default")
+        st.setdefault("index",  0)
+        st.setdefault("mode",   "normal")
+        st.setdefault("playing", False)
         return db
-
     except json.JSONDecodeError:
-        warn("Corrupted DB file. Resetting.")
-        return default_db
+        warn("Corrupted DB. Resetting."); return default_db
 
 
-
-def save_db(db):
+def save_db(db: dict) -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     fd, tmp = tempfile.mkstemp(dir=str(DB_PATH.parent))
     try:
         with os.fdopen(fd, "w") as f:
@@ -664,133 +414,176 @@ def save_db(db):
         if os.path.exists(tmp):
             os.remove(tmp)
 
-def _q(db, name):
-    if "queues" not in db:
-        db["queues"] = {}
+
+def _q(db: dict, name: str) -> list:
+    db.setdefault("queues", {})
     db["queues"].setdefault(name, [])
     return db["queues"][name]
 
 
-def current(db):
+def current(db: dict) -> str:
     return db["state"]["current_queue"]
 
 
-def set_queue(db, name):
+def set_queue(db: dict, name: str) -> None:
     db["queues"].setdefault(name, [])
     db["state"]["current_queue"] = name
 
 
-def state(db):
-    return db["state"]
-
-def add_to_queue(path, title="Unknown", queue_name=None):
-    db = load_db()
+def add_to_queue(path: str, title: str = "Unknown",
+                 queue_name: str | None = None) -> None:
+    db    = load_db()
     qname = queue_name or current(db)
-    q = _q(db, qname)
-
-    if not Path(path).exists():
-        err("File not found")
-        return
-
+    q     = _q(db, qname)
+    is_url = str(path).startswith(("http://", "https://"))
+    if not is_url and not Path(path).exists():
+        err("File not found"); return
     if any(x["path"] == str(path) for x in q):
-        warn("Already in queue")
-        return
-
+        warn("Already in queue"); return
     q.append({"path": str(path), "title": title})
     save_db(db)
     ok(f"Added → [{qname}] {title}")
 
-def remove_from_queue(index, queue_name=None):
-    db = load_db()
-    qname = queue_name or current(db)
-    q = _q(db, qname)
 
+def remove_from_queue(index: int, queue_name: str | None = None):
+    db    = load_db()
+    qname = queue_name or current(db)
+    q     = _q(db, qname)
     if 1 <= index <= len(q):
         removed = q.pop(index - 1)
         save_db(db)
         ok(f"Removed: {removed['title']}")
         return removed
-
     err("Invalid index")
 
-def move_queue_item(index, direction, queue_name=None):
-    db = load_db()
+
+def move_queue_item(index: int, direction: int,
+                    queue_name: str | None = None) -> bool:
+    db    = load_db()
     qname = queue_name or current(db)
-    q = _q(db, qname)
-
-    i = index - 1
-    j = i + direction
-
+    q     = _q(db, qname)
+    i, j  = index - 1, index - 1 + direction
     if 0 <= i < len(q) and 0 <= j < len(q):
         q[i], q[j] = q[j], q[i]
         save_db(db)
-        ok("Moved item")
-        return True
+        ok("Moved item"); return True
+    err("Cannot move"); return False
 
-    err("Cannot move")
-    return False
 
-def show_queue(queue_name=None):
-    db = load_db()
+def show_queue(queue_name: str | None = None) -> None:
+    db    = load_db()
     qname = queue_name or current(db)
-    q = _q(db, qname)
-
+    q     = _q(db, qname)
     if not q:
-        info(f"[{qname}] empty")
-        return
-
-    head(f"Queue: {qname} ({len(q)})")
-
+        info(f"[{qname}] empty"); return
+    head(f"Queue: {qname}  ({len(q)} songs)")
     for i, item in enumerate(q, 1):
-        exists = Path(item["path"]).exists()
-        symbol = "✔" if exists else "✘"
-        color = C.GREEN if exists else C.RED
+        exists = Path(item["path"]).exists() or str(item["path"]).startswith("http")
+        sym    = "✔" if exists else "✘"
+        col    = C.GREEN if exists else C.RED
+        print(f"  {i:2}. {col}{sym}{C.RESET} {item['title'][:60]}")
 
-        print(f"{i:2}. {color}{symbol}{C.RESET} {item['title']}")
 
-def set_mode(mode):
+def set_mode(mode: str) -> None:
+    if mode not in ("normal", "shuffle", "repeat_all"):
+        err("Invalid mode"); return
     db = load_db()
-    if mode not in ["normal", "shuffle", "repeat_all"]:
-        err("Invalid mode")
-        return
-
     db["state"]["mode"] = mode
     save_db(db)
     ok(f"Mode → {mode}")
 
 
-def next_index(db, q):
-    """
-    Calculate next index based on current mode.
-    Returns new index without modifying db state.
-    """
+def next_index(db: dict, q: list) -> int:
+    """[FIX-6] Now actually called from play_queue."""
     if not q:
         return 0
-
-    st = db["state"]
-    mode = st.get("mode", "normal")
+    st          = db["state"]
+    mode        = st.get("mode", "normal")
     current_idx = st.get("index", 0)
-
     if mode == "shuffle":
-        new_idx = current_idx
-        while new_idx == current_idx and len(q) > 1:
-            new_idx = random.randint(0, len(q) - 1)
-        return new_idx
-
-    elif mode == "repeat_all":
+        candidates = [i for i in range(len(q)) if i != current_idx]
+        return random.choice(candidates) if candidates else 0
+    if mode == "repeat_all":
         return (current_idx + 1) % len(q)
+    return current_idx + 1          # normal: may exceed len(q) → stops
 
-    else:
-        return min(current_idx + 1, len(q) - 1)
 
 # ─────────────────────────────────────────────
-#  DOWNLOAD WITH RETRY  [Fix #3]
+#  [NEW-9] Queue rename / copy / delete / export
 # ─────────────────────────────────────────────
 
-def run_ytdlp_with_retry(cmd, cfg, label="Download"):
+def rename_queue(old: str, new: str) -> None:
+    db = load_db()
+    if old not in db["queues"]:
+        err(f"Queue '{old}' does not exist"); return
+    if new in db["queues"]:
+        err(f"Queue '{new}' already exists"); return
+    db["queues"][new] = db["queues"].pop(old)
+    if db["state"]["current_queue"] == old:
+        db["state"]["current_queue"] = new
+    save_db(db)
+    ok(f"Renamed '{old}' → '{new}'")
+
+
+def copy_queue(src: str, dst: str) -> None:
+    db = load_db()
+    if src not in db["queues"]:
+        err(f"Queue '{src}' does not exist"); return
+    db["queues"][dst] = list(db["queues"][src])
+    save_db(db)
+    ok(f"Copied '{src}' → '{dst}'")
+
+
+def delete_queue(name: str) -> None:
+    db = load_db()
+    if name == "default":
+        err("Cannot delete 'default' queue"); return
+    if name not in db["queues"]:
+        err(f"Queue '{name}' does not exist"); return
+    del db["queues"][name]
+    if db["state"]["current_queue"] == name:
+        db["state"]["current_queue"] = "default"
+    save_db(db)
+    ok(f"Deleted queue '{name}'")
+
+
+def export_queue_as_m3u(queue_name: str | None = None,
+                        out_path: str | None = None) -> None:
+    """[NEW-8] Export queue to .m3u playlist file."""
+    db    = load_db()
+    qname = queue_name or current(db)
+    q     = _q(db, qname)
+    if not q:
+        warn("Queue empty"); return
+    if not out_path:
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = str(Path.home() / f"musicloop_{qname}_{ts}.m3u")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n")
+        for item in q:
+            f.write(f"#EXTINF:-1,{item['title']}\n{item['path']}\n")
+    ok(f"Exported {len(q)} songs → {out_path}")
+
+
+def clear_queue(queue_name: str | None = None) -> None:
+    db    = load_db()
+    qname = queue_name or current(db)
+    if qname not in db.get("queues", {}):
+        err(f"Queue '{qname}' does not exist"); return
+    db["queues"][qname] = []
+    save_db(db)
+    ok(f"Queue '{qname}' cleared")
+
+
+# ─────────────────────────────────────────────
+#  DOWNLOAD WITH RETRY
+# ─────────────────────────────────────────────
+
+def run_ytdlp_with_retry(cmd: list, cfg: dict,
+                         label: str = "Download") -> tuple:
     """
     Run yt-dlp command with retry logic.
-    Streams stdout live. Returns (returncode, file_path, stderr).
+    Returns (returncode, file_path, stderr).
     """
     retries = cfg.get("retry_count", 3)
     delay   = cfg.get("retry_delay", 3)
@@ -799,17 +592,13 @@ def run_ytdlp_with_retry(cmd, cfg, label="Download"):
         if attempt > 1:
             warn(f"Retry {attempt}/{retries} in {delay}s...")
             time.sleep(delay)
-
         try:
             proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                cmd, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True
             )
-
             file_path = None
-            print(f"{C.DIM}", end="", flush=True)
+            print(C.DIM, end="", flush=True)
             for line in proc.stdout:
                 line = line.strip()
                 if line.startswith("/"):
@@ -817,77 +606,134 @@ def run_ytdlp_with_retry(cmd, cfg, label="Download"):
                 elif line:
                     print(f"  {line}", flush=True)
             print(C.RESET, end="")
-
             stderr_out = proc.stderr.read()
             proc.wait()
-
             if proc.returncode == 0:
                 return proc.returncode, file_path, stderr_out
-
-            # [Fix #2] log errors instead of swallowing
             err(f"{label} failed (attempt {attempt})")
             if stderr_out:
-                print(f"{C.DIM}  yt-dlp: {stderr_out[:200].strip()}{C.RESET}")
-
+                print(f"{C.DIM}  yt-dlp: {stderr_out[:300].strip()}{C.RESET}")
         except Exception as e:
-            err(f"{label} error (attempt {attempt}): {e}")  # [Fix #2]
+            err(f"{label} error (attempt {attempt}): {e}")
 
     return -1, None, "All retries exhausted"
 
-def search_results(query, limit=6):
-    """Return list of (title, url_or_id) from yt-dlp search"""
+
+def search_results(query: str, limit: int = 6) -> list[tuple[str, str]]:
+    """
+    [FIX-1] Removed invalid --limit flag. Use ytsearch{N}:query instead.
+    Returns list of (title, url_or_id).
+    Cached per session [NEW-1].
+    """
+    cache_key = f"{query}:{limit}"
+    if cache_key in _search_cache:
+        dprint(f"search cache hit: {query}")
+        return _search_cache[cache_key]
+
     cmd = [
-        "yt-dlp", "--flat-playlist", "--print", "%(title)s|%(url)s",
-        "--no-playlist", "--limit", str(limit),
-        f"ytsearch{limit}:{query}"
+        "yt-dlp", "--flat-playlist",
+        "--print", "%(title)s|%(url)s",
+        "--no-playlist",
+        f"ytsearch{limit}:{query}",   # [FIX-1] no --limit flag
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True,
+                                text=True, timeout=30)
         if result.returncode != 0:
+            dprint(f"yt-dlp search failed: {result.stderr[:200]}")
             return []
-
         entries = []
-        for line in result.stdout.strip().split('\n'):
-            if '|' in line:
-                title, url = line.rsplit('|', 1)
+        for line in result.stdout.strip().split("\n"):
+            if "|" in line:
+                title, url = line.rsplit("|", 1)
                 entries.append((title.strip(), url.strip()))
+        _search_cache[cache_key] = entries
         return entries
-    except Exception:
+    except Exception as e:
+        err(f"Search error: {e}")
         return []
 
 
-def search_and_download(query, cfg, selected_idx=0):
+# ─────────────────────────────────────────────
+#  [NEW-7] Song info panel
+# ─────────────────────────────────────────────
+
+def fetch_song_info(url_or_id: str) -> dict | None:
+    """Fetch rich metadata for a song via yt-dlp --dump-json."""
+    cmd = ["yt-dlp", "--dump-json", "--no-playlist",
+           "--quiet", url_or_id]
+    try:
+        result = subprocess.run(cmd, capture_output=True,
+                                text=True, timeout=20)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def show_song_info(url_or_id: str) -> None:
+    info("Fetching song metadata...")
+    data = fetch_song_info(url_or_id)
+    if not data:
+        warn("Could not fetch info."); return
+    head("Song Info")
+    fields = [
+        ("Title",    data.get("title", "N/A")),
+        ("Uploader", data.get("uploader", "N/A")),
+        ("Duration", f"{int(data.get('duration', 0) or 0)//60}m "
+                     f"{int(data.get('duration', 0) or 0)%60}s"),
+        ("Views",    f"{data.get('view_count', 0):,}"),
+        ("Upload",   data.get("upload_date", "N/A")),
+        ("URL",      data.get("webpage_url", url_or_id)[:70]),
+    ]
+    for label, val in fields:
+        print(f"  {C.CYAN}{label:<12}{C.RESET} {val}")
+
+
+def search_and_download(query: str, cfg: dict,
+                        selected_idx: int = 0) -> tuple[str | None, str | None]:
     info(f"Searching: {C.BOLD}{query}{C.RESET}")
     entries = search_results(query)
     if not entries:
-        err("No results found")
-        return None, None
+        err("No results found"); return None, None
+
     if selected_idx == 0 and len(entries) > 1:
-        head(f"Search results for: {query}")
+        head(f"Results for: {query}")
         for i, (title, _) in enumerate(entries[:6], 1):
             print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
         print(f"  {C.CYAN}0.{C.RESET} Cancel")
-        choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
-        if not choice.isdigit() or int(choice) == 0:
+        print(f"  {C.CYAN}i N.{C.RESET} Info for result N")
+        raw = input(f"\n{C.WHITE}Pick (1-{len(entries)}): {C.RESET}").strip()
+        # [NEW-7] info shortcut
+        if raw.lower().startswith("i "):
+            idx_part = raw[2:].strip()
+            if idx_part.isdigit():
+                sel = int(idx_part) - 1
+                if 0 <= sel < len(entries):
+                    show_song_info(entries[sel][1])
+                    input(f"{C.DIM}Press Enter to continue...{C.RESET}")
+            return search_and_download(query, cfg, 0)
+        if not raw.isdigit() or int(raw) == 0:
             return None, None
-        selected_idx = int(choice) - 1
+        selected_idx = int(raw) - 1
+
     if selected_idx >= len(entries):
-        err("Invalid selection")
-        return None, None
+        err("Invalid selection"); return None, None
+
     title, url_or_id = entries[selected_idx]
-    info(f"Downloading: {title[:50]}")
+    info(f"Downloading: {title[:55]}")
     os.makedirs(cfg["download_dir"], exist_ok=True)
     cmd = [
         "yt-dlp", "-x",
         "--audio-format", cfg["audio_format"],
         "-o", f"{cfg['download_dir']}/%(title)s.%(ext)s",
         "--print", "after_move:filepath",
-        "--newline", url_or_id
+        "--newline", url_or_id,
     ]
     rc, file_path, _ = run_ytdlp_with_retry(cmd, cfg, "Download")
     if rc != 0 or not file_path or not os.path.exists(file_path):
-        err("Could not download song.")
-        return None, None
+        err("Download failed."); return None, None
     title = Path(file_path).stem
     ok(f"Downloaded: {title}")
     if cfg.get("notify"):
@@ -895,24 +741,20 @@ def search_and_download(query, cfg, selected_idx=0):
     save_to_history(title, file_path, "yt-dlp")
     return file_path, title
 
-def download_from_url(url, cfg):
+
+def download_from_url(url: str, cfg: dict) -> tuple[str | None, str | None]:
     info("Downloading from URL...")
     os.makedirs(cfg["download_dir"], exist_ok=True)
-
     cmd = [
         "yt-dlp", "-x",
         "--audio-format", cfg["audio_format"],
         "-o", f"{cfg['download_dir']}/%(title)s.%(ext)s",
         "--print", "after_move:filepath",
-        "--newline", url
+        "--newline", url,
     ]
-
     rc, file_path, _ = run_ytdlp_with_retry(cmd, cfg, "Download")
-
     if rc != 0 or not file_path or not os.path.exists(file_path):
-        err("Could not download.")
-        return None, None
-
+        err("Download failed."); return None, None
     title = Path(file_path).stem
     ok(f"Downloaded: {title}")
     if cfg.get("notify"):
@@ -922,75 +764,106 @@ def download_from_url(url, cfg):
 
 
 # ─────────────────────────────────────────────
-#  STREAMING MODE  [Feature #7]
+#  [NEW-6] Batch download
 # ─────────────────────────────────────────────
 
-def get_stream_url(query, cfg, selected_idx=0):
+def batch_download(query: str, cfg: dict) -> list[str]:
     """
-    DEPRECATED: Use direct resolution in interactive menu instead.
-    Kept for backward compatibility with CLI --stream flag.
-    Get direct audio stream URL — optional selection from results
+    Search for query, let user select multiple results, download all.
+    Returns list of downloaded file paths.
     """
+    entries = search_results(query, limit=8)
+    if not entries:
+        err("No results found"); return []
+    head(f"Batch results for: {query}")
+    for i, (t, _) in enumerate(entries, 1):
+        print(f"  {C.CYAN}{i}.{C.RESET} {t[:70]}")
+    print(f"\n{C.DIM}Enter numbers separated by spaces or ranges (e.g. 1 3 5-7){C.RESET}")
+    raw = input(f"{C.WHITE}Select: {C.RESET}").strip()
+    if not raw:
+        return []
+    selected: list[int] = []
+    for part in raw.replace(",", " ").split():
+        if "-" in part:
+            try:
+                a, b = map(int, part.split("-", 1))
+                selected.extend(range(a, b + 1))
+            except ValueError:
+                pass
+        elif part.isdigit():
+            selected.append(int(part))
+    selected = [i for i in dict.fromkeys(selected) if 1 <= i <= len(entries)]
+    if not selected:
+        warn("No valid selections"); return []
+    info(f"Downloading {len(selected)} songs...")
+    paths = []
+    for i, idx in enumerate(selected, 1):
+        title_preview, url_or_id = entries[idx - 1]
+        info(f"[{i}/{len(selected)}] {title_preview[:50]}")
+        fp, _ = search_and_download(title_preview, cfg, idx - 1)
+        if fp:
+            paths.append(fp)
+    ok(f"Batch complete: {len(paths)}/{len(selected)} downloaded")
+    return paths
+
+
+# ─────────────────────────────────────────────
+#  STREAMING
+# ─────────────────────────────────────────────
+
+def get_stream_url(query: str, cfg: dict,
+                   selected_idx: int = 0) -> tuple[str | None, str | None]:
+    """Resolve direct audio stream URL from search."""
     entries = search_results(query)
     if not entries:
-        err("No results found")
-        return None, None
-
-    # Only show selection if no index provided or index is 0
+        err("No results found"); return None, None
     if selected_idx <= 0:
-        head(f"Search results for: {query}")
-        for i, (title, _) in enumerate(entries[:6], 1):
-            print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
+        head(f"Results for: {query}")
+        for i, (t, _) in enumerate(entries[:6], 1):
+            print(f"  {C.CYAN}{i}.{C.RESET} {t[:70]}")
         print(f"  {C.CYAN}0.{C.RESET} Cancel")
-        choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
-        if not choice.isdigit() or int(choice) == 0:
+        raw = input(f"\n{C.WHITE}Pick (1-{len(entries)}): {C.RESET}").strip()
+        if not raw.isdigit() or int(raw) == 0:
             return None, None
-        selected_idx = int(choice) - 1
+        selected_idx = int(raw) - 1
     else:
-        selected_idx = selected_idx  # Use provided index (0-based)
-
+        selected_idx = selected_idx - 1
     if selected_idx >= len(entries):
-        err("Invalid selection")
-        return None, None
-
+        err("Invalid selection"); return None, None
     title, url_or_id = entries[selected_idx]
-    info(f"Resolving stream for: {title[:50]}")
-
-    # If it's a full URL, return directly
-    if url_or_id.startswith(('http://', 'https://')):
+    info(f"Resolving stream: {title[:50]}")
+    if url_or_id.startswith(("http://", "https://")):
         return url_or_id, title
-
-    # Otherwise resolve to stream URL
-    resolve_cmd = ["yt-dlp", "-f", "bestaudio", "-g", url_or_id]
     try:
-        result = subprocess.run(resolve_cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            ["yt-dlp", "-f", "bestaudio", "-g", url_or_id],
+            capture_output=True, text=True, timeout=30
+        )
         if result.returncode == 0:
-            stream_url = result.stdout.strip().split('\n')[0]
+            stream_url = result.stdout.strip().split("\n")[0]
             return stream_url, title
     except Exception as e:
         err(f"Resolution error: {e}")
     return None, None
 
 
-def play_stream(query, loop_mode, loop_value, cfg):
-    """Stream audio directly — zero storage used."""
-    result = get_stream_url(query, cfg)
-    if not result:
-        err("Could not get stream URL.")
-        return
-    stream_url, title = result
+def play_stream(query: str, loop_mode: str, loop_value,
+                cfg: dict) -> None:
+    stream_url, title = get_stream_url(query, cfg)
+    if not stream_url:
+        err("Could not get stream URL."); return
     play_file(stream_url, loop_mode, loop_value, cfg, f"[STREAM] {title}")
 
 
 # ─────────────────────────────────────────────
-#  MPV IPC CONTROLLER  [Fix #2: errors logged]
+#  MPV IPC CONTROLLER
 # ─────────────────────────────────────────────
 
 class MPVController:
-    def __init__(self, socket_path=None):
+    def __init__(self, socket_path: str | None = None):
         self.socket_path = socket_path or IPC_SOCKET
 
-    def _send(self, command_dict):
+    def _send(self, command_dict: dict) -> str | None:
         try:
             payload = json.dumps(command_dict) + "\n"
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -999,96 +872,149 @@ class MPVController:
                 s.sendall(payload.encode())
                 return s.recv(4096).decode().strip()
         except socket.timeout:
-            err("IPC timeout — mpv may have closed")
-            return None
+            dprint("IPC timeout"); return None
         except FileNotFoundError:
-            err(f"IPC socket not found: {self.socket_path}")
-            return None
+            dprint(f"IPC socket missing: {self.socket_path}"); return None
         except ConnectionRefusedError:
-            err("IPC connection refused — mpv not running?")
-            return None
+            dprint("IPC connection refused"); return None
         except Exception as e:
-            err(f"IPC error: {e}")   # [Fix #2] no silent swallowing
-            return None
+            dprint(f"IPC error: {e}"); return None
 
-    def pause(self):           self._send({"command": ["set_property", "pause", True]})
-    def resume(self):          self._send({"command": ["set_property", "pause", False]})
-    def toggle_pause(self):    self._send({"command": ["cycle", "pause"]})
-    def set_volume(self, v):   self._send({"command": ["set_property", "volume", v]})
-    def volume_up(self, s=5):  self._send({"command": ["add", "volume", s]})
-    def volume_down(self, s=5):self._send({"command": ["add", "volume", -s]})
-    def quit(self):            self._send({"command": ["quit"]})
+    def pause(self):            self._send({"command": ["set_property", "pause", True]})
+    def resume(self):           self._send({"command": ["set_property", "pause", False]})
+    def toggle_pause(self):     self._send({"command": ["cycle", "pause"]})
+    def set_volume(self, v):    self._send({"command": ["set_property", "volume", v]})
+    def volume_up(self, s=5):   self._send({"command": ["add", "volume",  s]})
+    def volume_down(self, s=5): self._send({"command": ["add", "volume", -s]})
+    def quit(self):             self._send({"command": ["quit"]})
 
-    def get_title(self):
+    # [NEW-12] seek support
+    def seek_fwd(self, secs: int = 10):
+        self._send({"command": ["seek", secs, "relative"]})
+    def seek_back(self, secs: int = 10):
+        self._send({"command": ["seek", -secs, "relative"]})
+
+    def get_title(self) -> str:
         resp = self._send({"command": ["get_property", "media-title"]})
         if resp:
             try:
                 return json.loads(resp).get("data", "")
-            except Exception as e:
-                err(f"IPC parse error: {e}")
+            except Exception:
+                pass
         return ""
 
-    def is_alive(self):
+    def get_position(self) -> float | None:
+        """Return current playback position in seconds."""
+        resp = self._send({"command": ["get_property", "time-pos"]})
+        if resp:
+            try:
+                return json.loads(resp).get("data")
+            except Exception:
+                pass
+        return None
+
+    def get_duration(self) -> float | None:
+        """Return total duration in seconds."""
+        resp = self._send({"command": ["get_property", "duration"]})
+        if resp:
+            try:
+                return json.loads(resp).get("data")
+            except Exception:
+                pass
+        return None
+
+    def is_alive(self) -> bool:
         return os.path.exists(self.socket_path)
 
 
 # ─────────────────────────────────────────────
-#  NON-BLOCKING CONTROL LOOP  [Fix #1]
+#  [NEW-2] Progress bar rendering
+# ─────────────────────────────────────────────
+
+def _format_time(secs: float | None) -> str:
+    if secs is None:
+        return "--:--"
+    secs = int(secs)
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+def _render_progress(mpv: MPVController, bar_width: int = 30) -> str:
+    pos  = mpv.get_position()
+    dur  = mpv.get_duration()
+    if pos is None or dur is None or dur <= 0:
+        return ""
+    frac   = min(pos / dur, 1.0)
+    filled = int(frac * bar_width)
+    bar    = "█" * filled + "░" * (bar_width - filled)
+    return (f"\r{C.DIM}  {_format_time(pos)} "
+            f"[{C.CYAN}{bar}{C.DIM}] "
+            f"{_format_time(dur)}{C.RESET}  ")
+
+
+# ─────────────────────────────────────────────
+#  CONTROL LOOP
 # ─────────────────────────────────────────────
 
 CONTROLS_HELP = (
-    "  [space]=pause/resume  [+/-]=volume  "
+    "  [space]=pause/resume  [←/→]=seek10s  [+/-]=vol  "
     "[v N+Enter]=set vol  [q]=quit  [?]=help"
 )
 
-DEBUG = True
 
-def dprint(msg):
-    if DEBUG:
-        print(msg)
-
-
-def control_loop_raw(mpv: MPVController):
+def control_loop_raw(mpv: MPVController,
+                     sleep_until: float | None = None) -> None:
     """
-    Raw tty single-keypress control.
-    select() makes reads non-blocking — zero lag.
+    Raw tty single-keypress control with progress bar.
+    sleep_until: epoch time after which we force quit (sleep timer).
     """
     print(f"{C.DIM}{CONTROLS_HELP}{C.RESET}")
     print(f"{C.DIM}  (no Enter needed for most keys){C.RESET}\n")
-
-    paused = False
+    paused       = False
+    last_bar_t   = 0.0
 
     with RawInput() as raw:
         if not raw.is_raw:
-            control_loop_line(mpv)
-            return
+            control_loop_line(mpv); return
 
         buf = ""
         while mpv.is_alive():
+            # [NEW-3] sleep timer check
+            if sleep_until and time.time() >= sleep_until:
+                mpv.quit()
+                print(f"\n{C.YELLOW}⏰ Sleep timer reached.{C.RESET}")
+                break
+
             ch = raw.read_key(timeout=0.15)
+
+            # [NEW-2] progress bar update every second
+            now = time.time()
+            if now - last_bar_t >= 1.0:
+                bar_str = _render_progress(mpv)
+                if bar_str:
+                    print(bar_str, end="", flush=True)
+                last_bar_t = now
+
             if ch is None:
                 continue
 
-            # Volume-set mode: "v" → digits → Enter
+            # Volume-set mode
             if buf.startswith("v"):
                 if ch in ("\r", "\n"):
                     try:
                         vol = int(buf[1:].strip())
                         mpv.set_volume(vol)
-                        if DEBUG:
-                            print(f"\r{C.GREEN}✔  Volume → {vol}   {C.RESET}")
+                        print(f"\r{C.GREEN}✔  Volume → {vol}   {C.RESET}")
                     except ValueError:
-                        if DEBUG:
-                            print(f"\r{C.RED}✘  Invalid volume   {C.RESET}")
+                        print(f"\r{C.RED}✘  Invalid volume   {C.RESET}")
                     buf = ""
                 elif ch.isdigit() or ch == " ":
                     buf += ch
-                    if DEBUG:
-                        print(f"\r{C.CYAN}vol: {buf[1:]}  {C.RESET}", end="", flush=True)
+                    print(f"\r{C.CYAN}vol: {buf[1:]}  {C.RESET}",
+                          end="", flush=True)
                 elif ch == "\x7f":
                     buf = buf[:-1]
-                    if DEBUG:
-                        print(f"\r{C.CYAN}vol: {buf[1:]}   {C.RESET}", end="", flush=True)
+                    print(f"\r{C.CYAN}vol: {buf[1:]}   {C.RESET}",
+                          end="", flush=True)
                 else:
                     buf = ""
                 continue
@@ -1097,107 +1023,113 @@ def control_loop_raw(mpv: MPVController):
                 paused = not paused
                 if paused:
                     mpv.pause()
-                    if DEBUG:
-                        print(f"\r{C.YELLOW}⏸  Paused          {C.RESET}")
+                    print(f"\r{C.YELLOW}⏸  Paused          {C.RESET}")
                 else:
                     mpv.resume()
-                    if DEBUG:
-                        print(f"\r{C.GREEN}▶  Playing         {C.RESET}")
-
+                    print(f"\r{C.GREEN}▶  Playing         {C.RESET}")
             elif ch in ("+", "="):
                 mpv.volume_up()
-                if DEBUG:
-                    print(f"\r{C.GREEN}🔊 Volume +5       {C.RESET}")
-
+                print(f"\r{C.GREEN}🔊 Volume +5       {C.RESET}")
             elif ch in ("-", "_"):
                 mpv.volume_down()
-                if DEBUG:
-                    print(f"\r{C.GREEN}🔉 Volume -5       {C.RESET}")
-
+                print(f"\r{C.GREEN}🔉 Volume -5       {C.RESET}")
             elif ch == "v":
                 buf = "v"
-                if DEBUG:
-                    print(f"\r{C.CYAN}vol: {C.RESET}", end="", flush=True)
-
+                print(f"\r{C.CYAN}vol: {C.RESET}", end="", flush=True)
+            # [NEW-12] seek keys
+            elif ch == "l":
+                mpv.seek_fwd(10)
+                print(f"\r{C.CYAN}⏩ +10s             {C.RESET}")
+            elif ch == "h":
+                mpv.seek_back(10)
+                print(f"\r{C.CYAN}⏪ -10s             {C.RESET}")
             elif ch in ("q", "Q", "\x03"):
                 mpv.quit()
-                if DEBUG:
-                    print(f"\r{C.RED}⏹  Stopped         {C.RESET}")
+                print(f"\r{C.RED}⏹  Stopped         {C.RESET}")
                 break
-
             elif ch == "?":
                 print(f"\n{C.DIM}{CONTROLS_HELP}{C.RESET}")
 
 
-def control_loop_line(mpv: MPVController):
-    """Fallback line-mode controls when raw tty is unavailable."""
-    info("Controls (line mode — press Enter after each): "
-         "p=pause  r=resume  +=vol+  -=vol-  v N=set volume  q=quit")
+def control_loop_line(mpv: MPVController) -> None:
+    info("Controls: p=pause  r=resume  +=vol+  -=vol-  "
+         "v N=volume  l=fwd10s  h=back10s  q=quit")
     while mpv.is_alive():
         try:
             cmd = input().strip().lower()
-            if cmd == "p":   mpv.pause();   info("Paused")
-            elif cmd == "r": mpv.resume();  info("Resumed")
-            elif cmd == "+": mpv.volume_up();   info("Volume +5")
-            elif cmd == "-": mpv.volume_down(); info("Volume -5")
+            if cmd == "p":           mpv.pause();     info("Paused")
+            elif cmd == "r":         mpv.resume();    info("Resumed")
+            elif cmd == "+":         mpv.volume_up(); info("Volume +5")
+            elif cmd == "-":         mpv.volume_down();info("Volume -5")
+            elif cmd == "l":         mpv.seek_fwd();  info("+10s")
+            elif cmd == "h":         mpv.seek_back(); info("-10s")
             elif cmd.startswith("v "):
                 try:
-                    mpv.set_volume(int(cmd.split()[1]))
-                    info("Volume set")
+                    mpv.set_volume(int(cmd.split()[1])); info("Volume set")
                 except (ValueError, IndexError):
                     warn("Usage: v <0-130>")
             elif cmd == "q":
                 mpv.quit(); info("Stopped"); break
         except (EOFError, KeyboardInterrupt):
-            mpv.quit()
-            break
+            mpv.quit(); break
 
 
 # ─────────────────────────────────────────────
-#  PLAYBACK CORE (SAFE FIXED VERSION)
+#  [NEW-4] Equalizer presets
 # ─────────────────────────────────────────────
 
-def now_playing_display(title, mode_str):
-    bar = "─" * 50
+_EQ_PRESETS: dict[str, str] = {
+    "flat":          "",
+    "bass_boost":    "bass=g=5:f=110:w=0.6",
+    "vocal_clarity": "equalizer=f=1000:width_type=o:width=2:g=3",
+    "treble_boost":  "treble=g=5:f=8000:w=0.6",
+    "low_cut":       "highpass=f=80",
+}
+
+
+def eq_mpv_flag(preset: str) -> list[str]:
+    af = _EQ_PRESETS.get(preset, "")
+    return [f"--af={af}"] if af else []
+
+
+# ─────────────────────────────────────────────
+#  PLAYBACK CORE
+# ─────────────────────────────────────────────
+
+def now_playing_display(title: str, mode_str: str) -> None:
+    bar = "─" * 52
     print(f"\n{C.MAGENTA}{bar}{C.RESET}")
     print(f"{C.BOLD}{C.WHITE}  🎵  {title[:45]}{C.RESET}")
     print(f"{C.DIM}  Mode: {mode_str}{C.RESET}")
     print(f"{C.MAGENTA}{bar}{C.RESET}")
 
 
-def play_file(file_path, loop_mode, loop_value, cfg, title=""):
-    # Fix: Handle URLs gracefully (don't use Path() on them)
-    is_url = str(file_path).startswith(('http://', 'https://'))
+def play_file(file_path, loop_mode: str, loop_value,
+              cfg: dict, title: str = "",
+              sleep_minutes: float | None = None) -> None:
+    """
+    Core playback. sleep_minutes enables [NEW-3] sleep timer.
+    [FIX-3] taste tracking now lives inside try-block; finally only cleans up.
+    [FIX-8] socket removal guard fixed.
+    """
+    is_url = str(file_path).startswith(("http://", "https://"))
     if not title:
-        if is_url:
-            title = "Streaming Audio"
-        else:
-            title = Path(str(file_path)).stem
+        title = "Streaming Audio" if is_url else Path(str(file_path)).stem
 
     mpv_cmd = [
-        "mpv",
-        "--no-video",
-
-        # FIX #1: clean output (prevents ugly terminal spam)
-        "--no-terminal",
-        "--quiet",
-        "--msg-level=all=no",
-
-        # IPC (unchanged logic, safer path usage)
+        "mpv", "--no-video", "--no-terminal",
+        "--quiet", "--msg-level=all=no",
         f"--input-ipc-server={IPC_SOCKET}",
-
         f"--volume={cfg.get('volume', 100)}",
-    ]
+    ] + eq_mpv_flag(cfg.get("eq_preset", "flat"))  # [NEW-4]
 
     if loop_mode == "count":
         mpv_cmd.append(f"--loop-file={loop_value}")
         mode_str = f"Loop × {loop_value}"
-    elif loop_mode == "time":
+    elif loop_mode in ("time", "inf"):
         mpv_cmd.append("--loop-file=inf")
-        mode_str = f"Loop for {loop_value} min"
-    elif loop_mode == "inf":
-        mpv_cmd.append("--loop-file=inf")
-        mode_str = "Loop ∞"
+        mode_str = (f"Loop for {loop_value} min"
+                    if loop_mode == "time" else "Loop ∞")
     else:
         mode_str = "Play once"
 
@@ -1209,8 +1141,12 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
     now_playing_display(title, mode_str)
     send_notification("▶ Now Playing", title)
 
+    proc   = None
+    mpv    = None
+    start  = time.time()
+
     try:
-        # FIX #2: safer socket removal (avoid race crash)
+        # [FIX-8] clean stale socket before launching mpv
         try:
             os.remove(IPC_SOCKET)
         except FileNotFoundError:
@@ -1218,8 +1154,8 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
 
         proc = subprocess.Popen(mpv_cmd)
 
-        # FIX #3: safer IPC wait (also detects mpv crash)
-        for _ in range(50):  # up to ~5 seconds
+        # Wait for IPC socket (up to 5s), detect early crash
+        for _ in range(50):
             if proc.poll() is not None:
                 break
             if os.path.exists(IPC_SOCKET):
@@ -1227,18 +1163,25 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
             time.sleep(0.1)
 
         if not os.path.exists(IPC_SOCKET):
-            warn("IPC socket did not appear — controls unavailable")
+            warn("IPC socket not ready — controls unavailable")
 
         mpv = MPVController()
 
+        # Sleep timer [NEW-3]
+        sleep_until: float | None = None
+        if sleep_minutes and sleep_minutes > 0:
+            sleep_until = time.time() + sleep_minutes * 60
+            info(f"Sleep timer: {sleep_minutes} min")
+
         ctrl_thread = threading.Thread(
-            target=control_loop_raw, args=(mpv,), daemon=True
+            target=control_loop_raw,
+            args=(mpv, sleep_until),
+            daemon=True
         )
         ctrl_thread.start()
 
         if loop_mode == "time":
             timeout = loop_value * 60
-            start = time.time()
             while proc.poll() is None:
                 if time.time() - start >= timeout:
                     mpv.quit()
@@ -1248,295 +1191,241 @@ def play_file(file_path, loop_mode, loop_value, cfg, title=""):
         else:
             proc.wait()
 
-    except KeyboardInterrupt:
+        # [FIX-3] taste tracking here, inside try, after playback ends
+        played = time.time() - start
         try:
-            mpv.quit()
-        except Exception:
-            pass
-        proc.terminate()
-        print()
-        warn("Interrupted")
-        # Don't track taste if user forcefully interrupted early
-        return
-
-    # Track taste after successful playback (not interrupted)
-    try:
-        if not str(file_path).startswith(('http://', 'https://')):
-            update_taste_profile(title, file_path)
-        else:
-            update_taste_profile(title, file_path, played_duration=30)
-    except Exception as e:
-        if DEBUG:
+            update_taste_profile(title, str(file_path),
+                                 played_duration=int(played))
+        except Exception as e:
             dprint(f"Taste tracking skipped: {e}")
 
-
+    except KeyboardInterrupt:
+        if mpv:
+            try: mpv.quit()
+            except Exception: pass
+        if proc:
+            proc.terminate()
+        print()
+        warn("Interrupted")
 
     finally:
         if cfg.get("wake_lock"):
             release_wake_lock()
-
-        # FIX #4: safe cleanup
         try:
             if os.path.exists(IPC_SOCKET):
                 os.remove(IPC_SOCKET)
         except Exception:
             pass
 
-#fixed play queue function
-def play_queue(cfg, queue_name=None, auto_clear=False):
-    db = load_db()
+
+def play_queue(cfg: dict, queue_name: str | None = None,
+               auto_clear: bool = False) -> None:
+    db    = load_db()
     qname = queue_name or current(db)
-    q = _q(db, qname)
+    q     = _q(db, qname)
 
     if not q:
-        warn("Queue empty")
-        return
+        warn("Queue empty"); return
 
     st = db["state"]
     st["playing"] = True
     save_db(db)
 
-    head(f"Playing [{qname}] mode={st['mode']}")
+    head(f"Playing [{qname}]  mode={st['mode']}")
 
     current_idx = st.get("index", 0)
     if current_idx >= len(q):
         current_idx = 0
         st["index"] = 0
         save_db(db)
+
     while current_idx < len(q) and st["playing"]:
-        item = q[current_idx]
-        path = item["path"]
+        item  = q[current_idx]
+        path  = item["path"]
         title = item["title"]
-        if not path.startswith(('http://', 'https://')) and not Path(path).exists():
+        is_url = path.startswith(("http://", "https://"))
+
+        if not is_url and not Path(path).exists():
             warn(f"Missing file: {title}")
-            if input(f"{C.CYAN}Remove from queue? [y/N]: {C.RESET}").lower() == 'y':
+            if input(f"{C.CYAN}Remove from queue? [y/N]: {C.RESET}").lower() == "y":
                 q.pop(current_idx)
                 save_db(db)
                 continue
-            else:
-                current_idx += 1
-                continue
+            current_idx += 1
+            continue
+
         info(f"[{current_idx+1}/{len(q)}] {title}")
         st["index"] = current_idx
         save_db(db)
+
         play_file(path, "once", None, cfg, title)
-        db = load_db()
-        st = db["state"]
-        q = _q(db, qname)
+
+        # reload state after play (user may have changed mode/queue)
+        db    = load_db()
+        st    = db["state"]
+        q     = _q(db, qname)
+
         if not st["playing"]:
-            warn("Playback stopped by user")
-            break
-        db["history"].insert(0, {
-            "title": title,
-            "path": str(path),
-            "source": "queue",
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-        })
-        db["history"] = db["history"][:50]
-        save_db(db)
-        mode = st["mode"]
+            warn("Playback stopped"); break
 
-        if mode == "shuffle":
-            remaining_indices = [i for i in range(len(q)) if i != current_idx]
-            if remaining_indices:
-                current_idx = random.choice(remaining_indices)
-            else:
-                current_idx = len(q)
-        elif mode == "repeat_all":
-            if current_idx + 1 >= len(q):
-                current_idx = 0
-                info("Repeating queue from start")
-            else:
-                current_idx += 1
-
-        else:
-            current_idx += 1
+        # [FIX-6] use next_index() instead of inline math
+        st["index"] = current_idx
+        current_idx = next_index(db, q)
         st["index"] = current_idx
         save_db(db)
 
         if current_idx < len(q):
             time.sleep(0.5)
-    st["playing"] = False
 
+    st["playing"] = False
     if current_idx >= len(q):
         st["index"] = 0
-        ok("Queue playback completed")
+        ok("Queue playback complete")
     else:
-        warn("Playback stopped before completing queue")
-
+        warn("Playback stopped before queue end")
     save_db(db)
 
     if auto_clear and current_idx >= len(q):
+        db = load_db()
         db["queues"][qname] = []
         save_db(db)
-        ok(f"Queue '{qname}' cleared")
+        ok(f"Queue '{qname}' auto-cleared")
 
-def stop():
-    db = load_db()
-    db["state"]["playing"] = False
-    db["state"]["index"] = 0
-    save_db(db)
-    ok("Stopped")
 
+def stop() -> None:
+    """[FIX-5] Properly quit mpv via IPC first, then db state."""
     try:
         if os.path.exists(IPC_SOCKET):
             mpv = MPVController()
             mpv.quit()
     except Exception:
         pass
-
-def skip():
-    db = load_db()
-    db["state"]["index"] += 1
-    save_db(db)
-    ok("Skipped")
-
-
-def pause():
     db = load_db()
     db["state"]["playing"] = False
+    db["state"]["index"]   = 0
     save_db(db)
-    ok("Paused")
+    ok("Stopped")
 
-def clear_queue(queue_name=None):
+
+def skip() -> None:
     db = load_db()
-    qname = queue_name or current(db)
-    if qname not in db["queues"]:
-        err(f"Queue '{qname}' does not exist")
-        return
-    db["queues"][qname] = []
+    qname = current(db)
+    q     = _q(db, qname)
+    new_idx = db["state"].get("index", 0) + 1
+    if new_idx >= len(q):
+        warn("Already at end of queue"); return
+    db["state"]["index"] = new_idx
     save_db(db)
-    ok(f"Queue '{qname}' cleared")
+    ok(f"Skipped → #{new_idx+1}")
+
 
 # ─────────────────────────────────────────────
-#  PLAYLIST SUPPORT  [New Feature]
+#  PLAYLIST PARSE / LOAD
 # ─────────────────────────────────────────────
 
-def parse_playlist(playlist_path):
-    """
-    Parse .m3u, .m3u8, .pls playlist files.
-    Returns list of (path, title) tuples.
-    """
+def parse_playlist(playlist_path) -> list[tuple[str, str]]:
     playlist_path = Path(playlist_path)
     if not playlist_path.exists():
-        err(f"Playlist not found: {playlist_path}")
-        return []
+        err(f"Playlist not found: {playlist_path}"); return []
+    ext     = playlist_path.suffix.lower()
     entries = []
-    ext = playlist_path.suffix.lower()
     try:
-        with open(playlist_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        if ext in ['.m3u', '.m3u8']:
-            # Standard m3u - each line is a file path or URL
+        with open(playlist_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [l.strip() for l in f
+                     if l.strip() and not l.startswith("#")]
+        if ext in (".m3u", ".m3u8"):
             for line in lines:
-                if line and not line.startswith('#'):
-                    path = os.path.expanduser(line)
-                    title = Path(path).stem if not path.startswith(('http://', 'https://')) else "Stream"
-                    entries.append((path, title))
-        elif ext == '.pls':
-            # PLS format: File1=/path/to/song.mp3, Title1=Song Name
-            file_dict = {}
-            title_dict = {}
+                path  = os.path.expanduser(line)
+                title = (Path(path).stem
+                         if not path.startswith(("http://", "https://"))
+                         else "Stream")
+                entries.append((path, title))
+        elif ext == ".pls":
+            fd, td = {}, {}
             for line in lines:
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    if key.startswith('File'):
-                        idx = key[4:] if key[4:].isdigit() else '1'
-                        file_dict[idx] = value
-                    elif key.startswith('Title'):
-                        idx = key[5:] if key[5:].isdigit() else '1'
-                        title_dict[idx] = value
-            for idx in sorted(file_dict.keys()):
-                path = file_dict[idx]
-                title = title_dict.get(idx, Path(path).stem)
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    if key.startswith("File"):
+                        fd[key[4:]] = val
+                    elif key.startswith("Title"):
+                        td[key[5:]] = val
+            for idx in sorted(fd):
+                path  = fd[idx]
+                title = td.get(idx, Path(path).stem)
                 entries.append((path, title))
         else:
-            err(f"Unsupported playlist format: {ext}")
-            return []
+            err(f"Unsupported playlist format: {ext}"); return []
     except Exception as e:
-        err(f"Error parsing playlist: {e}")
-        return []
+        err(f"Error parsing playlist: {e}"); return []
     ok(f"Loaded {len(entries)} tracks from playlist")
     return entries
 
-def load_playlist_to_queue(playlist_path, queue_name=None):
-    """Load playlist entries into specified queue."""
+
+def load_playlist_to_queue(playlist_path,
+                            queue_name: str | None = None) -> bool:
     entries = parse_playlist(playlist_path)
     if not entries:
         return False
-    db = load_db()
+    db    = load_db()
     qname = queue_name or current(db)
-    q = _q(db, qname)
-
+    q     = _q(db, qname)
     added = 0
     for path, title in entries:
-        if os.path.exists(path) or path.startswith(('http://', 'https://')):
+        if (os.path.exists(path)
+                or path.startswith(("http://", "https://"))):
             if not any(x["path"] == path for x in q):
                 q.append({"path": path, "title": title})
                 added += 1
-
     save_db(db)
-    ok(f"Added {added}/{len(entries)} tracks to queue '{qname}'")
+    ok(f"Added {added}/{len(entries)} tracks to '{qname}'")
     return added > 0
 
+
 # ─────────────────────────────────────────────
-#  DAEMON MODE  [Feature #8]
+#  DAEMON MODE
 # ─────────────────────────────────────────────
 
-def start_daemon(file_path, cfg, title=""):
-    """Launch mpv fully detached — survives terminal close."""
-    title = title or Path(str(file_path)).stem
+def start_daemon(file_path, cfg: dict, title: str = "") -> None:
+    title      = title or Path(str(file_path)).stem
     daemon_sock = str(DAEMON_SOCK)
-
     if os.path.exists(daemon_sock):
         os.remove(daemon_sock)
-
     mpv_cmd = [
         "mpv", "--no-video", "--quiet",
         "--loop-file=inf",
         f"--input-ipc-server={daemon_sock}",
         f"--volume={cfg.get('volume', 100)}",
-        str(file_path)
-    ]
-
+        str(file_path),
+    ] + eq_mpv_flag(cfg.get("eq_preset", "flat"))
     proc = subprocess.Popen(
         mpv_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True      # detach from terminal
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True
     )
-
     with open(DAEMON_PID, "w") as f:
         json.dump({"pid": proc.pid, "title": title, "socket": daemon_sock}, f)
-
-    ok(f"Daemon started: {title} (PID {proc.pid})")
+    ok(f"Daemon started: {title}  (PID {proc.pid})")
     send_notification("▶ Daemon Playing", title)
-    info("Control with: musicloop.py --daemon-ctl [pause|resume|stop|status|vol]")
+    info("Control with: --daemon-ctl [pause|resume|stop|status|vol|seek]")
 
 
-def daemon_ctl(action, value=None):
-    """Control the running daemon instance."""
+def daemon_ctl(action: str, value=None) -> None:
     if not DAEMON_PID.exists():
-        err("No daemon running.")
-        return
-
+        err("No daemon running."); return
     with open(DAEMON_PID) as f:
         data = json.load(f)
-
     sock_path = data.get("socket", str(DAEMON_SOCK))
-    mpv = MPVController(socket_path=sock_path)
-
+    mpv       = MPVController(socket_path=sock_path)
     if not mpv.is_alive():
-        err("Daemon socket not found — daemon may have stopped.")
+        err("Daemon socket not found — may have stopped.")
         DAEMON_PID.unlink(missing_ok=True)
         return
-
     if action == "pause":
-        mpv.pause(); ok("Daemon paused")
+        mpv.pause();  ok("Daemon paused")
     elif action == "resume":
         mpv.resume(); ok("Daemon resumed")
     elif action == "stop":
-        mpv.quit(); ok("Daemon stopped")
+        mpv.quit();   ok("Daemon stopped")
         DAEMON_PID.unlink(missing_ok=True)
         if os.path.exists(sock_path):
             os.remove(sock_path)
@@ -1545,20 +1434,225 @@ def daemon_ctl(action, value=None):
             mpv.set_volume(int(value)); ok(f"Daemon volume → {value}")
         except ValueError:
             err("Volume must be an integer.")
+    elif action == "seek" and value is not None:
+        try:
+            secs = int(value)
+            if secs >= 0:
+                mpv.seek_fwd(secs)
+            else:
+                mpv.seek_back(abs(secs))
+            ok(f"Daemon seek {value}s")
+        except ValueError:
+            err("Seek value must be integer seconds.")
     elif action == "status":
         head("Daemon Status")
         print(f"  PID   : {data.get('pid')}")
         print(f"  Title : {data.get('title')}")
         print(f"  Alive : {mpv.is_alive()}")
+        pos = mpv.get_position()
+        dur = mpv.get_duration()
+        if pos is not None:
+            print(f"  Pos   : {_format_time(pos)} / {_format_time(dur)}")
     else:
         err(f"Unknown daemon action: {action}")
+
+
+# ─────────────────────────────────────────────
+#  TASTE TRACKING & RECOMMENDATIONS
+# ─────────────────────────────────────────────
+
+DEFAULT_TASTE = {
+    "user_id":    "default",
+    "created_at": "",
+    "last_updated": "",
+    "total_plays": 0,
+    "unique_songs": {},
+    "artist_stats": {},
+    "keyword_stats": {},
+    "listening_patterns": {
+        "morning": 0, "afternoon": 0, "evening": 0, "night": 0
+    },
+    "recommendation_settings": {
+        "algorithm":       "artist_based",
+        "auto_recommend":  True,
+        "daily_suggestions": 5,
+    },
+    "blacklist":    {"artists": [], "songs": [], "keywords": []},
+    "preferences":  {
+        "preferred_mood":     None,
+        "preferred_language": None,
+        "min_duration":       60,
+        "max_duration":       600,
+    },
+}
+
+
+def load_taste_profile() -> dict:
+    if TASTE_PATH.exists():
+        with open(TASTE_PATH) as f:
+            taste = json.load(f)
+        for key, val in DEFAULT_TASTE.items():
+            if key not in taste:
+                taste[key] = val
+        return taste
+    t = DEFAULT_TASTE.copy()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    t["created_at"] = t["last_updated"] = now
+    return t
+
+
+def save_taste_profile(taste: dict) -> None:
+    taste["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    TASTE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TASTE_PATH, "w") as f:
+        json.dump(taste, f, indent=2)
+
+
+def extract_taste_features(song_title: str) -> dict:
+    features = {"keywords": [], "language": "unknown", "mood": "neutral"}
+    tl = song_title.lower()
+    for kw in ["remix", "cover", "live", "official", "slowed", "reverb",
+               "qawwali", "sufi", "classical", "pop", "rock", "sped up"]:
+        if kw in tl:
+            features["keywords"].append(kw)
+    for lang, words in [
+        ("urdu",    ["mola", "haq", "qawwali", "sufi"]),
+        ("hindi",   ["jaan", "dil", "pyar", "ishq", "mohabbat"]),
+        ("punjabi", ["tera", "mera", "sadda", "challa"]),
+    ]:
+        if any(w in tl for w in words):
+            features["language"] = lang; break
+    for mood, words in [
+        ("calm",      ["slow", "calm", "peaceful", "spiritual", "sufi"]),
+        ("energetic", ["fast", "dance", "party", "remix", "bass"]),
+        ("sad",       ["sad", "heartbreak", "lonely", "tears"]),
+        ("happy",     ["happy", "joy", "celebrate", "smile"]),
+    ]:
+        if any(w in tl for w in words):
+            features["mood"] = mood; break
+    return features
+
+
+def update_taste_profile(song_title: str, path: str,
+                         played_duration: int | None = None) -> None:
+    taste    = load_taste_profile()
+    song_key = str(path)
+    if song_key not in taste["unique_songs"]:
+        taste["unique_songs"][song_key] = {
+            "title":             song_title,
+            "play_count":        0,
+            "last_played":       None,
+            "total_listened_sec": 0,
+            "features":          extract_taste_features(song_title),
+        }
+    sd = taste["unique_songs"][song_key]
+    sd["play_count"] += 1
+    sd["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if played_duration:
+        sd["total_listened_sec"] = sd.get("total_listened_sec", 0) + played_duration
+
+    artist = " ".join(song_title.split()[:2])
+    taste["artist_stats"].setdefault(artist, {"plays": 0, "last_played": None})
+    taste["artist_stats"][artist]["plays"] += 1
+    taste["artist_stats"][artist]["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for kw in sd["features"]["keywords"]:
+        taste["keyword_stats"][kw] = taste["keyword_stats"].get(kw, 0) + 1
+
+    h = datetime.now().hour
+    key = ("morning"   if 5  <= h < 12
+           else "afternoon" if 12 <= h < 17
+           else "evening"   if 17 <= h < 21
+           else "night")
+    taste["listening_patterns"][key] += 1
+    taste["total_plays"] += 1
+    save_taste_profile(taste)
+
+
+def get_daily_recommendations(limit: int = 5) -> list:
+    taste    = load_taste_profile()
+    algo     = taste["recommendation_settings"]["algorithm"]
+    blacklist = taste["blacklist"]["keywords"]
+    recs     = []
+
+    if algo == "keyword_based":
+        top_kw = sorted(taste["keyword_stats"].items(),
+                        key=lambda x: x[1], reverse=True)[:3]
+        if top_kw:
+            query   = " ".join(k for k, _ in top_kw)
+            results = search_results(query, limit)
+            recs    = [(t, u, f"Based on '{top_kw[0][0]}'")
+                       for t, u in results[:limit]]
+    elif algo == "artist_based":
+        top_a = sorted(taste["artist_stats"].items(),
+                       key=lambda x: x[1]["plays"], reverse=True)
+        if top_a:
+            artist  = top_a[0][0]
+            results = search_results(f"{artist} songs", limit)
+            recs    = [(t, u, f"Because you like {artist}")
+                       for t, u in results[:limit]]
+    else:   # hybrid
+        kw_res = ar_res = []
+        top_kw = sorted(taste["keyword_stats"].items(),
+                        key=lambda x: x[1], reverse=True)[:2]
+        if top_kw:
+            kw_res = search_results(" ".join(k for k, _ in top_kw), 3)
+        top_a = sorted(taste["artist_stats"].items(),
+                       key=lambda x: x[1]["plays"], reverse=True)
+        if top_a:
+            ar_res = search_results(f"{top_a[0][0]} songs", 3)
+        seen = set()
+        for t, u in kw_res + ar_res:
+            if t not in seen and len(recs) < limit:
+                seen.add(t)
+                recs.append((t, u, "Hybrid recommendation"))
+
+    return [(t, u, r) for t, u, r in recs
+            if not any(b in t.lower() for b in blacklist)]
+
+
+def show_daily_suggestions(cfg: dict) -> None:
+    head("🎵 Today's Recommendations")
+    recs = get_daily_recommendations(limit=7)
+    if not recs:
+        warn("Not enough listening data yet. Play some songs first!")
+        return
+    print(f"\n{C.CYAN}We think you'll like these:{C.RESET}\n")
+    for i, (title, url, reason) in enumerate(recs, 1):
+        print(f"  {C.GREEN}{i}.{C.RESET} {title[:60]}")
+        print(f"     {C.DIM}→ {reason}{C.RESET}")
+    print(f"\n  {C.YELLOW}s{C.RESET}. Switch algorithm")
+    print(f"  {C.YELLOW}a{C.RESET}. Add all to queue")
+    print(f"  {C.YELLOW}0{C.RESET}. Back")
+    choice = input(f"\n{C.WHITE}Pick number or command: {C.RESET}").strip().lower()
+    if choice == "s":
+        taste = load_taste_profile()
+        cycle = ["keyword_based", "artist_based", "hybrid"]
+        cur   = taste["recommendation_settings"]["algorithm"]
+        nxt   = cycle[(cycle.index(cur) + 1) % len(cycle)]
+        taste["recommendation_settings"]["algorithm"] = nxt
+        save_taste_profile(taste)
+        info(f"Switched to {nxt}, regenerating...")
+        show_daily_suggestions(cfg); return
+    elif choice == "a":
+        for title, url, _ in recs:
+            fp, _ = search_and_download(title, cfg, 0)
+            if fp:
+                add_to_queue(fp, title)
+        ok(f"Added {len(recs)} songs to queue")
+        if input(f"{C.CYAN}Start queue now? [y/N]: {C.RESET}").lower() == "y":
+            play_queue(cfg)
+        return
+    elif choice.isdigit() and 1 <= int(choice) <= len(recs):
+        title, url, _ = recs[int(choice) - 1]
+        play_stream(title, "once", None, cfg)
 
 
 # ─────────────────────────────────────────────
 #  INPUT HELPERS
 # ─────────────────────────────────────────────
 
-def choose(prompt, options):
+def choose(prompt: str, options: list) -> str:
     print()
     for key, label in options:
         print(f"  {C.CYAN}{key}{C.RESET}. {label}")
@@ -1569,33 +1663,54 @@ def choose(prompt, options):
                 return val
         err("Invalid choice.")
 
-def get_int(prompt):
+
+def get_int(prompt: str) -> int:
     while True:
         try:
             v = int(input(f"{C.WHITE}{prompt}: {C.RESET}"))
-            if v > 0: return v
+            if v > 0:
+                return v
             err("Must be > 0")
         except ValueError:
             err("Enter a number.")
 
-def get_float(prompt):
+
+def get_float(prompt: str) -> float:
     while True:
         try:
             v = float(input(f"{C.WHITE}{prompt}: {C.RESET}"))
-            if v > 0: return v
+            if v > 0:
+                return v
             err("Must be > 0")
         except ValueError:
             err("Enter a number.")
 
-def get_file_path(prompt):
-    while True:
-        p = input(f"{C.WHITE}{prompt}: {C.RESET}").strip()
-        path_of_file = f'/data/data/com.termux/files/home/storage/downloads/songs/{p}'
-        p = os.path.expanduser(p)
-        if os.path.exists(path_of_file): return path_of_file
-        err("File not found.")
 
-def get_loop_mode():
+def get_file_path(prompt: str) -> str:
+    """
+    [FIX-2] Rewrote broken dual-path logic.
+    Checks the given path directly (with tilde expansion),
+    then falls back to the songs directory if needed.
+    No more infinite loop.
+    """
+    SONGS_DIR = Path("/data/data/com.termux/files/home/storage/downloads/songs")
+    while True:
+        raw = input(f"{C.WHITE}{prompt}: {C.RESET}").strip()
+        if not raw:
+            continue
+        # 1. Try expanded path as-is
+        p = Path(os.path.expanduser(raw))
+        if p.exists():
+            return str(p)
+        # 2. Try inside the songs directory
+        candidate = SONGS_DIR / raw
+        if candidate.exists():
+            return str(candidate)
+        err(f"File not found: {raw}")
+        warn(f"(Searched in: {p}  and  {candidate})")
+
+
+def get_loop_mode() -> str:
     return choose("Loop mode", [
         ("1", "Loop by count"),
         ("2", "Loop by time (minutes)"),
@@ -1603,7 +1718,8 @@ def get_loop_mode():
         ("4", "Play once"),
     ])
 
-def get_loop_params(mode):
+
+def get_loop_params(mode: str) -> tuple:
     if mode == "1":   return "count", get_int("Repeat how many times")
     elif mode == "2": return "time",  get_float("Play for how many minutes")
     elif mode == "3": return "inf",   None
@@ -1611,17 +1727,22 @@ def get_loop_params(mode):
 
 
 # ─────────────────────────────────────────────
-#  SETTINGS MENU  [Fix #5: always returns cfg]
+#  SETTINGS MENU
 # ─────────────────────────────────────────────
 
-def settings_menu(cfg):
+def settings_menu(cfg: dict) -> dict:
     head("Settings")
-    print(f"  {C.DIM}Download dir : {cfg['download_dir']}{C.RESET}")
-    print(f"  {C.DIM}Audio format : {cfg['audio_format']}{C.RESET}")
-    print(f"  {C.DIM}Volume       : {cfg['volume']}{C.RESET}")
-    print(f"  {C.DIM}Notify       : {cfg['notify']}{C.RESET}")
-    print(f"  {C.DIM}Wake lock    : {cfg['wake_lock']}{C.RESET}")
-    print(f"  {C.DIM}Retries      : {cfg['retry_count']}{C.RESET}")
+    rows = [
+        ("Download dir",  cfg["download_dir"]),
+        ("Audio format",  cfg["audio_format"]),
+        ("Volume",        cfg["volume"]),
+        ("Notifications", cfg["notify"]),
+        ("Wake lock",     cfg["wake_lock"]),
+        ("Retries",       cfg["retry_count"]),
+        ("EQ preset",     cfg.get("eq_preset", "flat")),  # [NEW-4]
+    ]
+    for label, val in rows:
+        print(f"  {C.DIM}{label:<16}: {val}{C.RESET}")
 
     what = choose("Edit", [
         ("1", "Download directory"),
@@ -1630,9 +1751,9 @@ def settings_menu(cfg):
         ("4", "Toggle notifications"),
         ("5", "Toggle wake lock"),
         ("6", "Retry count"),
-        ("7", "Back"),
+        ("7", f"EQ preset  (current: {cfg.get('eq_preset','flat')})"),
+        ("8", "Back"),
     ])
-
     if what == "1":
         d = input(f"{C.WHITE}New dir: {C.RESET}").strip()
         cfg["download_dir"] = os.path.expanduser(d)
@@ -1652,10 +1773,254 @@ def settings_menu(cfg):
         ok(f"Wake lock {'on' if cfg['wake_lock'] else 'off'}")
     elif what == "6":
         cfg["retry_count"] = get_int("Retries (1-5)")
-
+    elif what == "7":
+        presets = list(_EQ_PRESETS.keys())
+        print(f"\n  Options: {', '.join(presets)}")
+        chosen = input(f"{C.WHITE}EQ preset: {C.RESET}").strip()
+        if chosen in presets:
+            cfg["eq_preset"] = chosen
+            ok(f"EQ → {chosen}")
+        else:
+            warn("Unknown preset, keeping current.")
     save_config(cfg)
     ok("Settings saved.")
-    return cfg   # [Fix #5]
+    return cfg
+
+
+# ─────────────────────────────────────────────
+#  TASTE PROFILE DISPLAY
+# ─────────────────────────────────────────────
+
+def display_taste_summary(taste: dict) -> None:
+    clear_screen()
+    print(f"\n{C.CYAN}{C.BOLD}🎵 YOUR MUSICAL DNA{C.RESET}\n")
+    print(f"{C.GREEN}📊 Stats:{C.RESET}")
+    print(f"   Total plays  : {taste['total_plays']}")
+    print(f"   Unique songs : {len(taste['unique_songs'])}")
+    print(f"   Artists      : {len(taste['artist_stats'])}")
+
+    if taste["artist_stats"]:
+        print(f"\n{C.YELLOW}🎤 Top Artists:{C.RESET}")
+        for i, (a, s) in enumerate(
+            sorted(taste["artist_stats"].items(),
+                   key=lambda x: x[1]["plays"], reverse=True)[:5], 1
+        ):
+            bar = "▰" * min(20, s["plays"])
+            print(f"   {i}. {a[:30]:<30} {bar} {s['plays']}")
+
+    if taste["keyword_stats"]:
+        print(f"\n{C.MAGENTA}🔑 Top Keywords:{C.RESET}")
+        for kw, cnt in sorted(taste["keyword_stats"].items(),
+                               key=lambda x: x[1], reverse=True)[:5]:
+            print(f"   • {kw}: {cnt}")
+
+    pats = taste["listening_patterns"]
+    total = sum(pats.values())
+    if total > 5:
+        print(f"\n{C.BLUE}⏰ When You Listen:{C.RESET}")
+        for label, key in [("🌅 Morning", "morning"), ("☀  Afternoon", "afternoon"),
+                            ("🌙 Evening", "evening"), ("🌃 Night", "night")]:
+            pct = int(pats[key] / total * 100)
+            print(f"   {label}: {pct}%")
+
+    if taste["total_plays"] == 0:
+        print(f"\n{C.YELLOW}💡 Play some songs to build your profile!{C.RESET}")
+    print(f"\n{C.DIM}Press Enter...{C.RESET}")
+    input()
+
+
+def taste_menu(cfg: dict) -> None:
+    while True:
+        taste = load_taste_profile()
+        head("🎨 Taste Profile Manager")
+        print(f"{C.CYAN}📊 DNA snapshot:{C.RESET}")
+        print(f"   Songs: {taste['total_plays']}  "
+              f"Unique: {len(taste['unique_songs'])}  "
+              f"Artists: {len(taste['artist_stats'])}")
+        print(f"   Algorithm: {taste['recommendation_settings']['algorithm']}")
+        print()
+        options = [
+            ("1", "View detailed profile"),
+            ("2", "Change recommendation algorithm"),
+            ("3", "Reset taste profile"),
+            ("4", "Remove specific song"),
+            ("5", "Blacklist management"),
+            ("6", "Set preferences"),
+            ("7", "Export to JSON"),
+            ("8", "Today's recommendations"),
+            ("0", "Back"),
+        ]
+        for k, v in options:
+            print(f"   {C.CYAN}{k}{C.RESET}. {v}")
+        choice = input(f"\n{C.WHITE}Choose: {C.RESET}").strip()
+
+        if choice == "1":
+            display_taste_summary(taste)
+        elif choice == "2":
+            nw = choose("Algorithm", [
+                ("1", "Keyword-based"), ("2", "Artist-based"), ("3", "Hybrid")
+            ])
+            taste["recommendation_settings"]["algorithm"] = \
+                {"1": "keyword_based", "2": "artist_based", "3": "hybrid"}[nw]
+            save_taste_profile(taste)
+            ok("Algorithm updated")
+        elif choice == "3":
+            if input(f"{C.RED}Delete ALL taste data? Type 'yes': {C.RESET}") == "yes":
+                if TASTE_PATH.exists():
+                    TASTE_PATH.unlink()
+                ok("Profile reset.")
+            else:
+                warn("Cancelled")
+        elif choice == "4":
+            songs = list(taste["unique_songs"].items())
+            if not songs:
+                warn("No songs"); continue
+            for i, (_, d) in enumerate(songs[:20], 1):
+                print(f"  {i}. {d['title'][:50]} ({d['play_count']} plays)")
+            idx = input(f"{C.WHITE}Number to remove (0 cancel): {C.RESET}")
+            if idx.isdigit() and 1 <= int(idx) <= len(songs):
+                key, d = songs[int(idx) - 1]
+                del taste["unique_songs"][key]
+                save_taste_profile(taste)
+                ok(f"Removed '{d['title']}'")
+        elif choice == "5":
+            ba = choose("Blacklist", [
+                ("1", "Add artist"), ("2", "Add keyword"),
+                ("3", "View"), ("4", "Clear"),
+            ])
+            if ba == "1":
+                a = input(f"{C.WHITE}Artist: {C.RESET}").strip()
+                if a and a not in taste["blacklist"]["artists"]:
+                    taste["blacklist"]["artists"].append(a)
+                    save_taste_profile(taste); ok(f"Blacklisted: {a}")
+            elif ba == "2":
+                k = input(f"{C.WHITE}Keyword: {C.RESET}").strip()
+                if k and k not in taste["blacklist"]["keywords"]:
+                    taste["blacklist"]["keywords"].append(k)
+                    save_taste_profile(taste); ok(f"Blacklisted: {k}")
+            elif ba == "3":
+                head("Blacklist")
+                print(f"  Artists  : {taste['blacklist']['artists'] or 'None'}")
+                print(f"  Keywords : {taste['blacklist']['keywords'] or 'None'}")
+                input(f"{C.DIM}Press Enter...{C.RESET}")
+            elif ba == "4":
+                if input(f"{C.RED}Clear all? [y/N]: {C.RESET}").lower() == "y":
+                    taste["blacklist"] = {"artists": [], "songs": [], "keywords": []}
+                    save_taste_profile(taste); ok("Blacklist cleared")
+        elif choice == "6":
+            mood = choose("Mood", [("1","Calm"),("2","Energetic"),
+                                   ("3","Sad"),("4","Happy"),("0","None")])
+            taste["preferences"]["preferred_mood"] = \
+                {"1":"calm","2":"energetic","3":"sad","4":"happy","0":None}[mood]
+            lang = input(f"{C.WHITE}Language (urdu/hindi/punjabi/english) "
+                         f"or Enter to skip: {C.RESET}").strip().lower()
+            if lang in ("urdu", "hindi", "punjabi", "english"):
+                taste["preferences"]["preferred_language"] = lang
+            save_taste_profile(taste); ok("Preferences saved")
+        elif choice == "7":
+            ep = Path.home() / f"taste_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(ep, "w") as f:
+                json.dump(taste, f, indent=2, default=str)
+            ok(f"Exported → {ep}")
+        elif choice == "8":
+            show_daily_suggestions(cfg)
+        elif choice == "0":
+            break
+
+
+# ─────────────────────────────────────────────
+#  QUEUE MENU
+# ─────────────────────────────────────────────
+
+def queue_menu(cfg: dict) -> None:
+    while True:
+        db        = load_db()
+        current_q = db["state"]["current_queue"]
+        head(f"Queue System  (active: {current_q})")
+        action = choose("Action", [
+            ("1", "Show queue"),
+            ("2", "Play queue"),
+            ("3", "Add local file"),
+            ("4", "Remove item"),
+            ("5", "Move item up"),
+            ("6", "Move item down"),
+            ("7", "Clear current queue"),
+            ("8", "Switch / create queue"),
+            ("9", "List all queues"),
+            ("r", "Rename queue"),
+            ("c", "Copy queue"),
+            ("x", "Delete queue"),
+            ("e", "Export queue as .m3u"),   # [NEW-8]
+            ("a", "Load playlist (.m3u/.pls)"),
+            ("0", "Back"),
+        ])
+
+        if action == "1":   show_queue()
+        elif action == "2": play_queue(cfg)
+        elif action == "3":
+            p = get_file_path("File path")
+            add_to_queue(p, Path(p).stem)
+        elif action == "4":
+            show_queue()
+            remove_from_queue(get_int("Remove item #"))
+        elif action == "5":
+            show_queue()
+            move_queue_item(get_int("Move item # up"), -1)
+        elif action == "6":
+            show_queue()
+            move_queue_item(get_int("Move item # down"), 1)
+        elif action == "7":
+            clear_queue()
+        elif action == "8":
+            db     = load_db()
+            queues = list(db.get("queues", {}).keys())
+            head("All queues")
+            for i, q in enumerate(queues, 1):
+                marker = "▶" if q == current_q else " "
+                print(f"  {C.CYAN}{i}.{C.RESET} {marker} {q} ({len(db['queues'][q])})")
+            print(f"  {C.CYAN}n.{C.RESET}   Create new queue")
+            raw = input(f"{C.WHITE}Select or 'n' for new: {C.RESET}").strip()
+            if raw.lower() == "n":
+                name = input(f"{C.WHITE}New queue name: {C.RESET}").strip()
+                if name:
+                    db = load_db()
+                    set_queue(db, name)
+                    save_db(db)
+                    ok(f"Created and switched to '{name}'")
+            elif raw.isdigit() and 1 <= int(raw) <= len(queues):
+                db = load_db()
+                set_queue(db, queues[int(raw) - 1])
+                save_db(db)
+                ok(f"Switched to '{queues[int(raw)-1]}'")
+        elif action == "9":
+            db = load_db()
+            head("All Queues")
+            for name, items in db.get("queues", {}).items():
+                marker = "▶" if name == current_q else " "
+                print(f"  {marker} {name}  ({len(items)} songs)")
+        elif action == "r":   # [NEW-9]
+            old = input(f"{C.WHITE}Queue to rename: {C.RESET}").strip()
+            new = input(f"{C.WHITE}New name: {C.RESET}").strip()
+            if old and new: rename_queue(old, new)
+        elif action == "c":   # [NEW-9]
+            src = input(f"{C.WHITE}Source queue: {C.RESET}").strip()
+            dst = input(f"{C.WHITE}Destination name: {C.RESET}").strip()
+            if src and dst: copy_queue(src, dst)
+        elif action == "x":   # [NEW-9]
+            name = input(f"{C.WHITE}Queue to delete: {C.RESET}").strip()
+            if name:
+                if input(f"{C.RED}Delete '{name}'? [y/N]: {C.RESET}").lower() == "y":
+                    delete_queue(name)
+        elif action == "e":   # [NEW-8]
+            export_queue_as_m3u()
+        elif action == "a":
+            pl = input(f"{C.WHITE}Playlist path: {C.RESET}").strip()
+            if pl:
+                load_playlist_to_queue(os.path.expanduser(pl))
+                if input(f"{C.CYAN}Play now? [y/N]: {C.RESET}").lower() == "y":
+                    play_queue(cfg)
+        elif action == "0":
+            break
 
 
 # ─────────────────────────────────────────────
@@ -1663,18 +2028,31 @@ def settings_menu(cfg):
 # ─────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(prog="musicloop", description="🎧 MusicLoop v2.1")
+    p = argparse.ArgumentParser(prog="musicloop",
+                                description="🎧 MusicLoop v3.0 — Termux Edition")
+    # [NEW-13]
+    p.add_argument("--interactive", "-I", action="store_true",
+                   help="Force interactive menu even with other flags")
 
     src = p.add_mutually_exclusive_group()
-    src.add_argument("-s", "--search", metavar="QUERY", help="Search & download by name")
-    src.add_argument("-u", "--url",    metavar="URL",   help="Download from URL")
-    src.add_argument("-f", "--file",   metavar="PATH",  help="Play local file")
-    src.add_argument("--stream",       metavar="QUERY", help="Stream (no download)")
+    src.add_argument("-s", "--search", metavar="QUERY")
+    src.add_argument("-u", "--url",    metavar="URL")
+    src.add_argument("-f", "--file",   metavar="PATH")
+    src.add_argument("--stream",       metavar="QUERY")
+    src.add_argument("--batch",        metavar="QUERY",
+                     help="Batch download multiple results")
 
     lp = p.add_mutually_exclusive_group()
-    lp.add_argument("-n", "--count", metavar="N",   type=int,   help="Loop N times")
-    lp.add_argument("-t", "--time",  metavar="MIN", type=float, help="Loop N minutes")
-    lp.add_argument("-i", "--inf",   action="store_true",       help="Loop infinitely")
+    lp.add_argument("-n", "--count", metavar="N",   type=int)
+    lp.add_argument("-t", "--time",  metavar="MIN", type=float)
+    lp.add_argument("-i", "--inf",   action="store_true")
+
+    p.add_argument("--sleep",       metavar="MIN", type=float,
+                   help="[NEW-3] Auto-stop after N minutes")
+    p.add_argument("--eq",          metavar="PRESET",
+                   help=f"[NEW-4] EQ preset: {list(_EQ_PRESETS)}")
+    p.add_argument("--info",        metavar="URL_OR_ID",
+                   help="[NEW-7] Show song metadata")
 
     p.add_argument("--queue-add",    metavar="PATH")
     p.add_argument("--queue-play",   action="store_true")
@@ -1683,30 +2061,56 @@ def parse_args():
     p.add_argument("--queue-remove", metavar="N", type=int)
     p.add_argument("--queue-up",     metavar="N", type=int)
     p.add_argument("--queue-down",   metavar="N", type=int)
+    p.add_argument("--queue-export", action="store_true",
+                   help="[NEW-8] Export queue to .m3u")
 
-    p.add_argument("--daemon",      action="store_true", help="Play in background")
-    p.add_argument("--daemon-ctl",  metavar="ACTION",    help="pause|resume|stop|status|vol")
-    p.add_argument("--daemon-val",  metavar="VALUE",     help="Value for vol")
-    p.add_argument("--load-playlist", metavar="FILE", help="Load .m3u/.pls playlist to queue")
+    p.add_argument("--daemon",        action="store_true")
+    p.add_argument("--daemon-ctl",    metavar="ACTION")
+    p.add_argument("--daemon-val",    metavar="VALUE")
+    p.add_argument("--load-playlist", metavar="FILE")
 
-    p.add_argument("--history", action="store_true")
+    p.add_argument("--history",      action="store_true")
+    p.add_argument("--mode",         metavar="MODE",
+                   help="Set queue mode: normal|shuffle|repeat_all")
     return p.parse_args()
 
 
-def resolve_loop(args):
+def resolve_loop(args) -> tuple:
     if args.count: return "count", args.count
     if args.time:  return "time",  args.time
     if args.inf:   return "inf",   None
     return None, None
 
 
-def handle_args(args, cfg):
-    if args.queue_show:    show_queue();                        return True
-    if args.queue_clear:   clear_queue();                       return True
-    if args.queue_play:    play_queue(cfg);                     return True
-    if args.queue_remove:  remove_from_queue(args.queue_remove);return True
-    if args.queue_up:      move_queue_item(args.queue_up, -1);  return True
-    if args.queue_down:    move_queue_item(args.queue_down, 1); return True
+def handle_args(args, cfg: dict) -> bool:
+    # [FIX-4] load_playlist must be checked BEFORE any early returns
+    if args.load_playlist:
+        if load_playlist_to_queue(args.load_playlist):
+            if args.queue_play:
+                play_queue(cfg)
+        return True
+
+    if args.interactive:
+        return False    # fall through to interactive menu
+
+    if args.info:
+        show_song_info(args.info); return True
+
+    if args.eq:
+        if args.eq in _EQ_PRESETS:
+            cfg["eq_preset"] = args.eq
+        else:
+            warn(f"Unknown EQ preset '{args.eq}'. Options: {list(_EQ_PRESETS)}")
+
+    if args.queue_show:    show_queue();                         return True
+    if args.queue_clear:   clear_queue();                        return True
+    if args.queue_play:    play_queue(cfg);                      return True
+    if args.queue_remove:  remove_from_queue(args.queue_remove); return True
+    if args.queue_up:      move_queue_item(args.queue_up, -1);   return True
+    if args.queue_down:    move_queue_item(args.queue_down, 1);  return True
+    if args.queue_export:  export_queue_as_m3u();                return True
+    if args.mode:          set_mode(args.mode);                  return True
+
     if args.queue_add:
         p = os.path.expanduser(args.queue_add)
         if os.path.exists(p): add_to_queue(p, Path(p).stem)
@@ -1714,26 +2118,33 @@ def handle_args(args, cfg):
         return True
 
     if args.daemon_ctl:
-        daemon_ctl(args.daemon_ctl, args.daemon_val)
-        return True
+        daemon_ctl(args.daemon_ctl, args.daemon_val); return True
 
     if args.history:
         result = show_history()
         if result:
             if isinstance(result, dict) and result.get("action") == "queue_added":
-            # Queue was populated, optionally start playing
-                if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+                if input(f"{C.CYAN}Start queue now? [y/N]: {C.RESET}").lower() == "y":
                     play_queue(cfg)
             elif isinstance(result, str):
                 lm, lv = resolve_loop(args)
                 if lm is None:
                     lm, lv = get_loop_params(get_loop_mode())
-                play_file(result, lm, lv, cfg)
+                play_file(result, lm, lv, cfg,
+                          sleep_minutes=args.sleep)
+        return True
+
+    if args.batch:
+        paths = batch_download(args.batch, cfg)
+        if paths and input(f"{C.CYAN}Add all to queue? [y/N]: {C.RESET}").lower() == "y":
+            for fp in paths:
+                add_to_queue(fp, Path(fp).stem)
         return True
 
     if args.stream:
         lm, lv = resolve_loop(args)
-        if lm is None: lm, lv = get_loop_params(get_loop_mode())
+        if lm is None:
+            lm, lv = get_loop_params(get_loop_mode())
         play_stream(args.stream, lm, lv, cfg)
         return True
 
@@ -1759,365 +2170,42 @@ def handle_args(args, cfg):
         lm, lv = resolve_loop(args)
         if lm is None:
             lm, lv = get_loop_params(get_loop_mode())
-        play_file(file_path, lm, lv, cfg, title)
-    if args.load_playlist:
-        if load_playlist_to_queue(args.load_playlist):
-            if args.queue_play:
-                play_queue(cfg)
-        return True
+        play_file(file_path, lm, lv, cfg, title,
+                  sleep_minutes=args.sleep)
     return True
 
 
 # ─────────────────────────────────────────────
-#  INTERACTIVE MENUS
+#  INTERACTIVE MENU
 # ─────────────────────────────────────────────
-def queue_menu(cfg):
-    head("Queue System")
 
-    db = load_db()
-    current_q = db["state"]["current_queue"]
-
-    action = choose(
-        f"Queue action (current: {current_q})",
-        [
-            ("1", "Show queue"),
-            ("2", "Play queue"),
-            ("3", "Add file to queue"),
-            ("4", "Remove item by index"),
-            ("5", "Move item up"),
-            ("6", "Move item down"),
-            ("7", "Clear current queue"),
-            ("8", "Switch queue"),
-            ("a", "Load playlist( .m3u/.pls)"),
-            ("9", "List all queues"),
-            ("0", "Back"),
-        ]
-    )
-
-    # -------------------
-    # BASIC OPERATIONS
-    # -------------------
-
-    if action == "1":
-        show_queue()
-
-    elif action == "2":
-        play_queue(cfg)
-
-    elif action == "3":
-        p = get_file_path("File path")
-        add_to_queue(p, Path(p).stem)
-
-    elif action == "4":
-        show_queue()
-        remove_from_queue(get_int("Remove item #"))
-
-    elif action == "5":
-        show_queue()
-        move_queue_item(get_int("Move item # up"), -1)
-
-    elif action == "6":
-        show_queue()
-        move_queue_item(get_int("Move item # down"), 1)
-
-    elif action == "7":
-        clear_queue()
-
-    # -------------------
-    # MULTI-QUEUE FEATURES
-    # -------------------
-
-    elif action == "8":
-        db = load_db()
-        queues = list(db.get("queues", {}).keys())
-
-        if not queues:
-            warn("No queues exist")
-            return
-
-    # build indexed menu (stable input system)
-        options = [(str(i), q) for i, q in enumerate(queues)]
-
-        selected_index = choose(
-            "Select queue",
-            options
-         )
-
-        queue_name = queues[int(selected_index)]
-
-        if selected_index is None or selected_index == "":
-            warn("No selection made")
-            return
-
-        idx = int(selected_index)
-        if idx < 0 or idx >= len(queues):
-            warn("Out of range")
-            return
-
-        set_queue(db, queue_name)
-        save_db(db)
-
-        ok(f"Switched to queue: {queue_name}")
-
-
-    elif action == "9":
-        db = load_db()
-        queues = db.get("queues", {})
-
-        head("All Queues")
-        for name, items in queues.items():
-            print(f" - {name} ({len(items)})")
-    elif action == "a":
-        playlist_path = input(f"{C.WHITE}Playlist file path: {C.RESET}").strip()
-        if not playlist_path:
-            return
-        playlist_path = os.path.expanduser(playlist_path)
-        if load_playlist_to_queue(playlist_path):
-            if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
-                play_queue(cfg)
-
-    elif action == "0":
-        return
-
-def display_taste_summary(taste):
-    """Display taste profile in clean, readable format"""
-    clear_screen()
-    
-    print(f"\n{C.CYAN}{C.BOLD}🎵 YOUR MUSICAL DNA{C.RESET}\n")
-    
-    # Basic stats
-    print(f"{C.GREEN}📊 Your Stats:{C.RESET}")
-    print(f"   Total plays:    {taste['total_plays']}")
-    print(f"   Unique songs:   {len(taste['unique_songs'])}")
-    print(f"   Unique artists: {len(taste['artist_stats'])}")
-    
-    # Top artists (if any)
-    if taste['artist_stats']:
-        print(f"\n{C.YELLOW}🎤 Your Top Artists:{C.RESET}")
-        top_artists = sorted(taste['artist_stats'].items(), 
-                            key=lambda x: x[1]['plays'], reverse=True)[:5]
-        for i, (artist, stats) in enumerate(top_artists, 1):
-            bar = "▰" * min(20, stats['plays'])
-            print(f"   {i}. {artist[:30]:<30} {bar} {stats['plays']}")
-    
-    # Top keywords (if any)
-    if taste['keyword_stats']:
-        print(f"\n{C.MAGENTA}🔑 Your Music Keywords:{C.RESET}")
-        top_keywords = sorted(taste['keyword_stats'].items(), 
-                             key=lambda x: x[1], reverse=True)[:5]
-        for keyword, count in top_keywords:
-            print(f"   • {keyword}: {count} times")
-    
-    # Listening patterns (if enough data)
-    if taste['total_plays'] > 5:
-        print(f"\n{C.BLUE}⏰ When You Listen Most:{C.RESET}")
-        patterns = taste['listening_patterns']
-        total = sum(patterns.values())
-        if total > 0:
-            morning = int((patterns['morning'] / total) * 100)
-            afternoon = int((patterns['afternoon'] / total) * 100)
-            evening = int((patterns['evening'] / total) * 100)
-            night = int((patterns['night'] / total) * 100)
-            print(f"   🌅 Morning:  {morning}%")
-            print(f"   ☀️ Afternoon: {afternoon}%")
-            print(f"   🌙 Evening:  {evening}%")
-            print(f"   🌃 Night:    {night}%")
-    
-    # Settings summary
-    print(f"\n{C.CYAN}⚙️ Active Settings:{C.RESET}")
-    algo_names = {"keyword_based": "Keyword-based", "artist_based": "Artist-based", "hybrid": "Hybrid"}
-    print(f"   Recommendation: {algo_names.get(taste['recommendation_settings']['algorithm'], 'Hybrid')}")
-    
-    if taste['preferences']['preferred_mood']:
-        print(f"   Mood filter:    {taste['preferences']['preferred_mood'].title()}")
-    if taste['preferences']['preferred_language']:
-        print(f"   Language filter: {taste['preferences']['preferred_language'].title()}")
-    
-    # Blacklist info (if anything blacklisted)
-    blacklist_count = len(taste['blacklist']['artists']) + len(taste['blacklist']['keywords'])
-    if blacklist_count > 0:
-        print(f"\n{C.RED}🚫 Blocked items: {blacklist_count}{C.RESET}")
-    
-    # Tip for new users
-    if taste['total_plays'] == 0:
-        print(f"\n{C.YELLOW}💡 Tip: Play some songs first and your taste profile will build automatically!{C.RESET}")
-    
-    print(f"\n{C.DIM}Press Enter to continue...{C.RESET}")
-    input()
-
-def _get_mood_emoji(mood):
-    """Return emoji for mood type"""
-    if not mood:
-        return "🎵"
-    emojis = {
-        "calm": "😌",
-        "energetic": "⚡", 
-        "sad": "😢",
-        "happy": "😊"
-    }
-    return emojis.get(mood, "🎵")
-
-def _get_algo_name(algo):
-    """Return readable algorithm name"""
-    if not algo:
-        return "Hybrid"
-    names = {
-        "keyword_based": "🔑 Keywords",
-        "artist_based": "🎤 Artists",
-        "hybrid": "🧬 Hybrid"
-    }
-    return names.get(algo, "Hybrid")
-
-def taste_menu(cfg):
-    """Interactive taste profile management"""
-    while True:
-        taste = load_taste_profile()
-        head("🎨 Taste Profile Manager")
-        # Display stats
-        print(f"{C.CYAN}📊 Your Music DNA:{C.RESET}")
-        print(f"   Total songs played: {taste['total_plays']}")
-        print(f"   Unique songs: {len(taste['unique_songs'])}")
-        print(f"   Unique artists: {len(taste['artist_stats'])}")
-        if taste['artist_stats']:
-            top_artist = sorted(taste['artist_stats'].items(), 
-                               key=lambda x: x[1]['plays'], reverse=True)[0]
-            print(f"   Top artist: {top_artist[0]} ({top_artist[1]['plays']} plays)")
-        if taste['keyword_stats']:
-            top_keyword = sorted(taste['keyword_stats'].items(), 
-                                key=lambda x: x[1], reverse=True)[0]
-            print(f"   Top keyword: {top_keyword[0]} ({top_keyword[1]} times)")
-        print(f"\n   Active algorithm: {taste['recommendation_settings']['algorithm']}")
-        print(f"\n{C.CYAN}Options:{C.RESET}")
-        print("   1. View detailed taste profile")
-        print("   2. Change recommendation algorithm")
-        print("   3. Reset entire taste profile (clear all data)")
-        print("   4. Remove specific song from taste memory")
-        print("   5. Blacklist artist/song/keyword")
-        print("   6. Set preferences (mood, language, duration)")
-        print("   7. Export taste data to JSON")
-        print("   8. Show today's recommendations")
-        print("   0. Back")
-        choice = input(f"\n{C.WHITE}Choose: {C.RESET}").strip()
-
-        if choice == "1":
-            display_taste_summary(taste)
-        elif choice == "2":
-            # Change algorithm
-            new_algo = choose("Select algorithm", [
-                ("1", "Keyword-based (recommends by music terms you like)"),
-                ("2", "Artist-based (recommends similar artists)"),
-                ("3", "Hybrid (combines both)")
-            ])
-            algo_map = {"1": "keyword_based", "2": "artist_based", "3": "hybrid"}
-            taste["recommendation_settings"]["algorithm"] = algo_map[new_algo]
-            save_taste_profile(taste)
-            ok(f"Algorithm switched to {algo_map[new_algo]}")
-        elif choice == "3":
-            # Reset all taste data
-            confirm = input(f"{C.RED}⚠️  Delete ALL taste data? Type 'yes' to confirm: {C.RESET}")
-            if confirm.lower() == 'yes':
-                os.remove(TASTE_PATH) if TASTE_PATH.exists() else None
-                ok("Taste profile reset. Start fresh!")
-            else:
-                warn("Cancelled")
-        elif choice == "4":
-            # Remove specific song
-            if not taste['unique_songs']:
-                warn("No songs in taste profile")
-                continue
-            songs = list(taste['unique_songs'].items())
-            print(f"\n{C.CYAN}Select song to remove:{C.RESET}")
-            for i, (_, data) in enumerate(songs[:20], 1):
-                print(f"  {i}. {data['title'][:50]} ({data['play_count']} plays)")
-            idx = input(f"\n{C.WHITE}Number to remove (0 to cancel): {C.RESET}")
-            if idx.isdigit() and 1 <= int(idx) <= len(songs):
-                song_key, song_data = songs[int(idx)-1]
-                del taste['unique_songs'][song_key]
-                save_taste_profile(taste)
-                ok(f"Removed '{song_data['title']}' from taste profile")
-        elif choice == "5":
-            # Blacklist management
-            black_action = choose("Blacklist action", [
-                ("1", "Add artist to blacklist"),
-                ("2", "Add keyword to blacklist"),
-                ("3", "View blacklist"),
-                ("4", "Clear blacklist")
-            ])
-            if black_action == "1":
-                artist = input(f"{C.WHITE}Artist name to blacklist: {C.RESET}").strip()
-                if artist and artist not in taste["blacklist"]["artists"]:
-                    taste["blacklist"]["artists"].append(artist)
-                    save_taste_profile(taste)
-                    ok(f"Blacklisted: {artist}")
-            elif black_action == "2":
-                keyword = input(f"{C.WHITE}Keyword to blacklist: {C.RESET}").strip()
-                if keyword and keyword not in taste["blacklist"]["keywords"]:
-                    taste["blacklist"]["keywords"].append(keyword)
-                    save_taste_profile(taste)
-                    ok(f"Blacklisted keyword: {keyword}")
-            elif black_action == "3":
-                head("Blacklist")
-                print(f"Artists: {taste['blacklist']['artists'] or 'None'}")
-                print(f"Songs: {taste['blacklist']['songs'] or 'None'}")
-                print(f"Keywords: {taste['blacklist']['keywords'] or 'None'}")
-                input(f"{C.DIM}Press Enter...{C.RESET}")
-            elif black_action == "4":
-                if input(f"{C.RED}Clear all blacklists? [y/N]: {C.RESET}").lower() == 'y':
-                    taste["blacklist"] = {"artists": [], "songs": [], "keywords": []}
-                    save_taste_profile(taste)
-                    ok("Blacklist cleared")
-        elif choice == "6":
-            # Set preferences
-            head("Set Preferences")
-            mood = choose("Preferred mood (optional)", [
-                ("1", "Calm/Spiritual"),
-                ("2", "Energetic"),
-                ("3", "Sad"),
-                ("4", "Happy"),
-                ("0", "None")
-            ])
-            mood_map = {"1": "calm", "2": "energetic", "3": "sad", "4": "happy", "0": None}
-            taste["preferences"]["preferred_mood"] = mood_map[mood]
-            lang = input(f"{C.WHITE}Preferred language (urdu/hindi/punjabi/english) or press Enter to skip: {C.RESET}")
-            if lang.lower() in ['urdu', 'hindi', 'punjabi', 'english']:
-                taste["preferences"]["preferred_language"] = lang.lower()
-            save_taste_profile(taste)
-            ok("Preferences saved")
-        elif choice == "7":
-            # Export taste data
-            export_path = Path.home() / f"musicloop_taste_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(export_path, 'w') as f:
-                json.dump(taste, f, indent=2, default=str)
-            ok(f"Taste data exported to {export_path}")
-        elif choice == "8":
-            show_daily_suggestions(cfg)
-        elif choice == "0":
-            break
-
-def interactive_menu(cfg):
+def interactive_menu(cfg: dict) -> None:
     while True:
         head("Main Menu")
         action = choose("Choose action", [
-            ("1", "Search & download by name"),
-            ("2", "Stream by name (instant, no download)"),
-            ("3", "Download from URL"),
-            ("4", "Play local file"),
-            ("5", "Play from history"),
-            ("6", "Queue management"),
-            ("7", "Daemon mode (background play)"),
-            ("8", "Settings"),
+            ("1", "Search & download"),
+            ("2", "Stream (instant, no download)"),
+            ("3", "Batch download"),          # [NEW-6]
+            ("4", "Download from URL"),
+            ("5", "Play local file"),
+            ("6", "Play from history"),
+            ("7", "Queue management"),
+            ("8", "Daemon (background play)"),
+            ("9", "Settings"),
             ("a", "Today's recommendations"),
-            ("b","Your taste profile"),
-            ("c", "Clear screen"),
-            ("d", "Exit"),
-          ])
+            ("b", "Taste profile"),
+            ("c", "Sleep timer play"),         # [NEW-3]
+            ("d", "Song info"),                # [NEW-7]
+            ("e", "Clear screen"),
+            ("0", "Exit"),
+        ])
 
         if action == "1":
             query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
             if not query: continue
             file_path, title = search_and_download(query, cfg)
             if not file_path: continue
-            if input(f"{C.CYAN}Add to queue instead? [y/N]: {C.RESET}").strip().lower() == "y":
+            if input(f"{C.CYAN}Add to queue instead? [y/N]: {C.RESET}").lower() == "y":
                 add_to_queue(file_path, title)
             else:
                 lm, lv = get_loop_params(get_loop_mode())
@@ -2125,142 +2213,147 @@ def interactive_menu(cfg):
 
         elif action == "2":
             query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
+            if not query: continue
             lm, lv = get_loop_params(get_loop_mode())
-            if not query:
-                err('no input given')
-                continue
-
-            # Get search results once
             entries = search_results(query)
             if not entries:
-                err("No results found")
-                continue
-
-            # Display results
+                err("No results found"); continue
             head(f"Results for: {query}")
-            for i, (title, _) in enumerate(entries[:6], 1):
-                print(f"  {C.CYAN}{i}.{C.RESET} {title[:70]}")
+            for i, (t, _) in enumerate(entries[:6], 1):
+                print(f"  {C.CYAN}{i}.{C.RESET} {t[:70]}")
             print(f"  {C.CYAN}0.{C.RESET} Cancel")
-
-            # Get user choice
-            choice = input(f"\n{C.WHITE}Pick number (1-{len(entries)}): {C.RESET}").strip()
-            if not choice.isdigit() or int(choice) == 0:
-                continue
-
-            selected_idx = int(choice) - 1
-            if selected_idx >= len(entries):
-                err("Invalid selection")
-                continue
-
-            # Get the selected entry
-            title, url_or_id = entries[selected_idx]
+            raw = input(f"\n{C.WHITE}Pick (1-{len(entries)}): {C.RESET}").strip()
+            if not raw.isdigit() or int(raw) == 0: continue
+            sel = int(raw) - 1
+            if sel >= len(entries):
+                err("Invalid selection"); continue
+            title, url_or_id = entries[sel]
             info(f"Selected: {title[:50]}")
-
-            # Get stream URL without re-searching (use the URL/ID we already have)
-            if url_or_id.startswith(('http://', 'https://')):
+            if url_or_id.startswith(("http://", "https://")):
                 stream_url = url_or_id
             else:
-                # Resolve to actual stream URL
-                resolve_cmd = ["yt-dlp", "-f", "bestaudio", "-g", url_or_id]
                 try:
-                    result = subprocess.run(resolve_cmd, capture_output=True, text=True, timeout=30)
-                    if result.returncode == 0:
-                        stream_url = result.stdout.strip().split('\n')[0]
-                    else:
-                        err("Could not resolve stream URL")
-                        continue
+                    res = subprocess.run(
+                        ["yt-dlp", "-f", "bestaudio", "-g", url_or_id],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if res.returncode != 0:
+                        err("Could not resolve stream URL"); continue
+                    stream_url = res.stdout.strip().split("\n")[0]
                 except Exception as e:
-                        err(f"Stream resolution failed: {e}")
-                        continue
+                    err(f"Stream resolution failed: {e}"); continue
             play_file(stream_url, lm, lv, cfg, f"[STREAM] {title}")
 
-        elif action == "3":
+        elif action == "3":     # [NEW-6]
+            query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
+            if not query: continue
+            paths = batch_download(query, cfg)
+            if paths and input(f"{C.CYAN}Add all to queue? [y/N]: {C.RESET}").lower() == "y":
+                for fp in paths:
+                    add_to_queue(fp, Path(fp).stem)
+
+        elif action == "4":
             url = input(f"\n{C.WHITE}URL: {C.RESET}").strip()
+            if not url: continue
             file_path, title = download_from_url(url, cfg)
             if not file_path: continue
             lm, lv = get_loop_params(get_loop_mode())
             play_file(file_path, lm, lv, cfg, title)
 
-        elif action == "4":
-            MUSIC_DIR = Path("/data/data/com.termux/files/home/storage/downloads/songs")
-            MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-            audio_extensions = ("*.mp3", "*.m4a", "*.opus", "*.flac", "*.wav", "*.ogg")
-            music_files = []
-            for ext in audio_extensions:
-                music_files.extend(MUSIC_DIR.glob(ext))
-
-                music_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-            if not music_files:
-                warn("No music files found in songs directory")
-                print(f"{C.DIM}Download some songs first using search option{C.RESET}")
-                continue
-            print(f"\n{C.BOLD}{C.CYAN}——— Available Files ({len(music_files)}) ———{C.RESET}\n")
-            display_limit = 30
-            for idx, file in enumerate(music_files[:display_limit], 1):
-                size_mb = file.stat().st_size / (1024 * 1024)
-                name = file.stem[:55] + "..." if len(file.stem) > 55 else file.stem
-                print(f"  {C.CYAN}{idx:3}.{C.RESET} {name:<58} {C.DIM}({size_mb:.1f} MB){C.RESET}")
-            if len(music_files) > display_limit:
-                print(f"\n  {C.DIM}... and {len(music_files) - display_limit} more files{C.RESET}")
-
-            while True:
-                try:
-                    choice = input(f"\n{C.WHITE}Enter number (or 0 to cancel): {C.RESET}").strip()
-                    if choice == "0":
-                        continue
-                    if choice.isdigit():
-                        idx = int(choice) - 1
-                        if 0 <= idx < len(music_files):
-                            fp = str(music_files[idx])
-                            title = music_files[idx].stem
-                            ok(f"Selected: {title}")
-                            break
-                        else:
-                            err(f"Invalid number. Choose 1-{len(music_files)}")
-                    else:
-                        err("Please enter a valid number")
-                except (ValueError, IndexError):
-                    err("Invalid selection")
-                    continue
-            lm, lv = get_loop_params(get_loop_mode())
-            play_file(fp, lm, lv, cfg, title)
-
         elif action == "5":
+            MUSIC_DIR = Path(cfg.get("download_dir", DEFAULT_DOWNLOAD_DIR))
+            MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+            exts  = ("*.mp3","*.m4a","*.opus","*.flac","*.wav","*.ogg")
+            files = []
+            for ext in exts:
+                files.extend(MUSIC_DIR.glob(ext))
+            files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            if not files:
+                warn("No music files found in songs directory"); continue
+            print(f"\n{C.BOLD}{C.CYAN}── Available Files ({len(files)}) ──{C.RESET}\n")
+            LIMIT = 30
+            for i, fp in enumerate(files[:LIMIT], 1):
+                size = fp.stat().st_size / (1024 * 1024)
+                name = (fp.stem[:55] + "...") if len(fp.stem) > 55 else fp.stem
+                print(f"  {C.CYAN}{i:3}.{C.RESET} {name:<58} {C.DIM}({size:.1f} MB){C.RESET}")
+            if len(files) > LIMIT:
+                print(f"\n  {C.DIM}... {len(files)-LIMIT} more{C.RESET}")
+            while True:
+                raw = input(f"\n{C.WHITE}Enter number (0 cancel): {C.RESET}").strip()
+                if raw == "0": break
+                if raw.isdigit():
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(files):
+                        fp    = str(files[idx])
+                        title = files[idx].stem
+                        ok(f"Selected: {title}")
+                        lm, lv = get_loop_params(get_loop_mode())
+                        play_file(fp, lm, lv, cfg, title)
+                        break
+                    err(f"Choose 1–{len(files)}")
+                else:
+                    err("Please enter a number")
+
+        elif action == "6":
             result = show_history()
             if result:
                 if isinstance(result, dict) and result.get("action") == "queue_added":
-                    if input(f"{C.CYAN}Start playing queue now? [y/N]: {C.RESET}").lower() == 'y':
+                    if input(f"{C.CYAN}Start queue now? [y/N]: {C.RESET}").lower() == "y":
                         play_queue(cfg)
                 elif isinstance(result, str):
                     lm, lv = get_loop_params(get_loop_mode())
                     play_file(result, lm, lv, cfg, Path(result).stem)
 
-        elif action == "6":
+        elif action == "7":
             queue_menu(cfg)
 
-        elif action == "7":
+        elif action == "8":
             head("Daemon Mode")
-            src = choose("Source", [("1", "Local file"), ("2", "Search & download")])
+            src = choose("Source", [("1","Local file"),("2","Search & download")])
             if src == "1":
                 fp = get_file_path("File path")
                 start_daemon(fp, cfg, Path(fp).stem)
             else:
                 q = input(f"{C.WHITE}Search query: {C.RESET}").strip()
-                fp, t = search_and_download(q, cfg)
-                if fp: start_daemon(fp, cfg, t)
+                if q:
+                    fp, t = search_and_download(q, cfg)
+                    if fp: start_daemon(fp, cfg, t)
 
-        elif action == "8":
-            cfg = settings_menu(cfg)   # [Fix #5] capture returned cfg
+        elif action == "9":
+            cfg = settings_menu(cfg)
 
         elif action == "a":
             show_daily_suggestions(cfg)
+
         elif action == "b":
             taste_menu(cfg)
-        elif action == "c":
-            clear_screen()
-            banner()
 
-        elif action == "d":
+        elif action == "c":     # [NEW-3] sleep timer
+            query = input(f"\n{C.WHITE}Search query: {C.RESET}").strip()
+            if not query: continue
+            mins = get_float("Stop after how many minutes")
+            file_path, title = search_and_download(query, cfg)
+            if file_path:
+                lm, lv = get_loop_params(get_loop_mode())
+                play_file(file_path, lm, lv, cfg, title, sleep_minutes=mins)
+
+        elif action == "d":     # [NEW-7]
+            query = input(f"\n{C.WHITE}Search query or URL: {C.RESET}").strip()
+            if query:
+                if query.startswith(("http://", "https://")):
+                    show_song_info(query)
+                else:
+                    entries = search_results(query, limit=3)
+                    if entries:
+                        show_song_info(entries[0][1])
+                    else:
+                        err("No results")
+                input(f"{C.DIM}Press Enter...{C.RESET}")
+
+        elif action == "e":
+            clear_screen(); banner()
+
+        elif action == "0":
             print(f"\n{C.CYAN}Ya Ali a.s madad 🎵{C.RESET}\n")
             sys.exit(0)
 
@@ -2269,13 +2362,21 @@ def interactive_menu(cfg):
 #  ENTRY POINT
 # ─────────────────────────────────────────────
 
-def main():
+def main() -> None:
     banner()
     check_dependencies()
     check_storage_permission()
 
     cfg  = load_config()
     args = parse_args()
+
+    # [NEW-13] --interactive forces menu even when other flags present
+    if args.interactive:
+        try:
+            interactive_menu(cfg)
+        except KeyboardInterrupt:
+            print(f"\n{C.CYAN}Ya Ali a.s madad 🎵{C.RESET}\n")
+        return
 
     if any(vars(args).values()):
         handled = handle_args(args, cfg)
@@ -2291,8 +2392,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
